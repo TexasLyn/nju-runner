@@ -1,0 +1,768 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+gpxart - 在指定边界多边形内生成「图形」运动轨迹 GPX
+
+和 runroute 的分工：
+  gpxart  负责「画什么形状、摆在哪里、会不会越界」；
+  runroute 负责「走多快、时间戳、GPS 漂移」，并直接调用它补时间。
+
+核心保证：**每个顶点都在边界内缩 margin 米之后的区域里**，逐点校验并报最小余量。
+
+用法:
+  gpxart list
+  gpxart make --shape heart --boundary boundary.geojson --size 560 --pace 6:00 -o heart.gpx
+  gpxart make --shape nju --boundary boundary.geojson --preview nju.png -o nju.gpx
+  gpxart check --boundary boundary.geojson --gpx heart.gpx
+"""
+import argparse
+import json
+import math
+import os
+import subprocess
+import sys
+import tempfile
+
+M_PER_DEG = 111320.0
+def _fn_find_runroute():
+    """优先用与本脚本同目录的 runroute（仓库自包含），再退回 ~/.local/bin。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in (os.path.join(here, "runroute"),
+              os.path.expanduser("~/.local/bin/runroute")):
+        if os.path.isfile(p):
+            return p
+    return os.path.expanduser("~/.local/bin/runroute")
+
+
+RUNROUTE = _fn_find_runroute()
+
+
+def m_per_deg_lon(lat):
+    return M_PER_DEG * math.cos(math.radians(lat))
+
+
+def read_boundary(path):
+    """读 GeoJSON / 纯坐标数组，返回外环 [(lon,lat), ...]。"""
+    raw = json.load(open(path, encoding="utf-8"))
+    if isinstance(raw, dict) and raw.get("type") == "FeatureCollection":
+        geom = raw["features"][0]["geometry"]
+    elif isinstance(raw, dict) and raw.get("type") == "Feature":
+        geom = raw["geometry"]
+    elif isinstance(raw, dict) and raw.get("type") == "Polygon":
+        geom = raw
+    elif isinstance(raw, list):
+        return raw
+    else:
+        raise SystemExit("看不懂的边界文件: %s" % path)
+    if geom["type"] == "Polygon":
+        rings = [geom["coordinates"][0]]
+    elif geom["type"] == "MultiPolygon":
+        rings = [p[0] for p in geom["coordinates"]]
+    else:
+        raise SystemExit("边界需为 Polygon/MultiPolygon，实际是 %s" % geom["type"])
+    return max(rings, key=lambda r: len(r))
+
+
+class Frame:
+    """等距圆柱近似：把经纬度和局部平面米坐标互相换算。"""
+
+    def __init__(self, ring):
+        self.lon0 = sum(p[0] for p in ring) / len(ring)
+        self.lat0 = sum(p[1] for p in ring) / len(ring)
+        self.k = m_per_deg_lon(self.lat0)
+
+    def fwd(self, lon, lat):
+        return ((lon - self.lon0) * self.k, (lat - self.lat0) * M_PER_DEG)
+
+    def inv(self, x, y):
+        return (self.lon0 + x / self.k, self.lat0 + y / M_PER_DEG)
+
+
+def shoelace(pts):
+    a = 0.0
+    for i in range(len(pts)):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % len(pts)]
+        a += x1 * y2 - x2 * y1
+    return a / 2.0
+
+
+def dist_to_poly(pt, poly):
+    """点到多边形边界的距离（正=在内，负=在外）。"""
+    x, y = pt
+    inside = False
+    n = len(poly)
+    best = float("inf")
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        if (y1 > y) != (y2 > y):
+            xin = (x2 - x1) * (y - y1) / (y2 - y1) + x1
+            if x < xin:
+                inside = not inside
+        dx, dy = x2 - x1, y2 - y1
+        L2 = dx * dx + dy * dy
+        t = 0.0 if L2 == 0 else max(0.0, min(1.0, ((x - x1) * dx + (y - y1) * dy) / L2))
+        d = math.hypot(x - (x1 + t * dx), y - (y1 + t * dy))
+        if d < best:
+            best = d
+    return best if inside else -best
+
+
+# ---------------------------------------------------------------- 图形库
+# 每个图形返回「单位坐标」点列，后续统一归一化 + 缩放。
+
+def _heart_loop(n=720):
+    """经典心形参数曲线，n 个点，首尾不重复。起点/终点都是顶端的心口（凹点）。"""
+    return [(16 * math.sin(t) ** 3,
+             13 * math.cos(t) - 5 * math.cos(2 * t)
+             - 2 * math.cos(3 * t) - math.cos(4 * t))
+            for t in (2 * math.pi * i / n for i in range(n))]
+
+
+def _close(seq):
+    return seq + [seq[0]]
+
+
+def _from_lowest(loop, reverse=False):
+    """从最低点（底尖）起笔走一圈再回底尖。横排时用它，让相邻爱心靠底尖连线。"""
+    k = min(range(len(loop)), key=lambda i: loop[i][1])
+    seq = loop[k:] + loop[:k]
+    if reverse:
+        seq = [seq[0]] + seq[:0:-1]
+    return _close(seq)
+
+
+def shape_heart(n=720):
+    return _close(_heart_loop(n))
+
+
+def shape_hearts_row(n=3, gap=0.30, per=360):
+    """n 个爱心横排，底尖对齐 —— 底尖之间自然连成一条「串珠」短线。
+
+    每个爱心从自己的底尖起笔、回底尖收笔，所以圈间连线只在 y=底尖 处，
+    不会横穿邻心的轮廓。
+    """
+    step = 32.0 * (1 + gap)
+    x0 = -(n - 1) * step / 2.0
+    pts = []
+    for i in range(n):
+        seq = _from_lowest(_heart_loop(per), reverse=(i % 2 == 1))
+        pts += [(x + x0 + i * step, y) for (x, y) in seq]
+    return pts
+
+
+def shape_hearts_nested(count=3, ratio=0.62, per=420):
+    """同心爱心：外圈最大，里面再套 count-1 个，等比缩小。
+
+    全部从各自的心口（顶端凹点）起笔，所以圈间接线是心口之间的一小段竖线，
+    落在爱心的凹口里，不压轮廓。bbox 中心对齐（心形重心偏上，直接按中心套会歪）。
+    """
+    if count < 2:
+        raise ValueError("同心爱心至少 2 个")
+    out = _close(_heart_loop(per))
+    oy = (max(p[1] for p in out) + min(p[1] for p in out)) / 2.0
+    for k in range(1, count):
+        s = ratio ** k
+        loop = _close(_heart_loop(per))
+        iy = (max(p[1] for p in loop) + min(p[1] for p in loop)) / 2.0 * s
+        shift = oy - iy
+        out += [(x * s, y * s + shift) for (x, y) in loop]
+    return out
+
+
+def shape_heartnest():
+    return shape_hearts_nested(count=2, ratio=0.50)
+
+
+def shape_star(n_per_edge=48):
+    """五角星：按 0→2→4→1→3→0 连笔（一笔画成的尖角星）。"""
+    verts = [(math.sin(math.radians(-90 + 72 * k)), math.cos(math.radians(-90 + 72 * k)))
+             for k in range(5)]
+    order = [0, 2, 4, 1, 3, 0]
+    pts = []
+    for i in range(len(order) - 1):
+        a, b = verts[order[i]], verts[order[i + 1]]
+        for j in range(n_per_edge):
+            f = j / n_per_edge
+            pts.append((a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f))
+    pts.append(verts[order[-1]])
+    return pts
+
+
+def shape_infinity(n=900):
+    """∞：伯努利双纽线，自交于原点。"""
+    pts = []
+    for i in range(n + 1):
+        t = 2 * math.pi * i / n
+        d = 1 + math.sin(t) ** 2
+        pts.append((math.cos(t) / d, math.sin(t) * math.cos(t) / d))
+    return pts
+
+
+def shape_spiral(turns=3.0, n=1400):
+    """阿基米德螺旋：从中心均匀向外张开。
+    注意别用「方形螺旋」——腿长 1,1,2,2,3,3… 时相邻腿近乎抵消，包围盒只有 ~20 单位
+    而笔画总长 ~420 单位，一缩放就变成十几公里，完全跑不动。"""
+    pts = []
+    for i in range(n + 1):
+        t = 2 * math.pi * turns * i / n
+        r = t / (2 * math.pi * turns)
+        pts.append((r * math.cos(t), r * math.sin(t)))
+    return pts
+
+
+def _glyph(one):
+    return one
+
+
+def _arc(cx, cy, rx, ry, a0, a1, n=24, ccw=False):
+    pts = []
+    for i in range(n + 1):
+        a = math.radians(a0 + (a1 - a0) * i / n)
+        # 屏幕坐标 y 向下，这里 y 向上，故取负
+        pts.append((cx + rx * math.cos(a), cy + ry * math.sin(a)))
+    return pts
+
+
+def _letters(text, gap=0.28, height=1.0):
+    """笔画字库：每个字形是一串连续点（0..1 盒内，y 向上）。"""
+    def N():
+        return [(0, 0), (0, 1), (1, 0), (1, 1)]
+    def J():
+        stem = [(0.75, 1), (0.75, 0.3)]
+        hook = _arc(0.45, 0.3, 0.3, 0.3, 0, 180, 24)[::-1]
+        hook = [(0.45 + 0.3 * math.cos(math.radians(a)), 0.3 - 0.3 * math.sin(math.radians(a)))
+                for a in range(0, 181, 8)]
+        tail = [(0.15, 0.3), (0.14, 0.52)]
+        return stem + hook[:-1] + tail
+    def U():
+        left = [(0, 1), (0, 0.4)]
+        bowl = [(0.5 + 0.5 * math.cos(math.radians(a)), 0.4 - 0.4 * math.sin(math.radians(a)))
+                for a in range(180, -1, -8)]
+        right = [(1, 0.4), (1, 1)]
+        return left + bowl + right
+    def V5():
+        return [(0.85, 1), (0.2, 1), (0.2, 0.6), (0.6, 0.6), (0.85, 0.45),
+                (0.85, 0.15), (0.6, 0.0), (0.18, 0.0)]
+    def V2():
+        top = [(0.15, 0.8), (0.3, 0.97), (0.6, 1.0), (0.82, 0.86), (0.84, 0.66),
+               (0.62, 0.48), (0.15, 0.0), (0.9, 0.0)]
+        return top
+    def V0():
+        return [(0.5 + 0.34 * math.cos(math.radians(a)), 0.5 + 0.5 * math.sin(math.radians(a)))
+                for a in range(90, -271, -8)]
+    table = {"N": N, "J": J, "U": U, "5": V5, "2": V2, "0": V0}
+    pts = []
+    for i, ch in enumerate(text):
+        g = table[ch]()
+        for (x, y) in g:
+            pts.append((x + i * (1 + gap), y * height))
+    return pts
+
+
+def shape_nju():
+    return _letters("NJU")
+
+
+def shape_520():
+    return _letters("520", gap=0.34)
+
+
+SHAPES = {
+    "heart":     (shape_heart,     560.0, "爱心"),
+    "hearts":    (shape_hearts_nested, 560.0, "三心同心（外/中/内）"),
+    "heartnest": (shape_heartnest, 560.0, "心中有心（两心）"),
+    "heartsrow": (shape_hearts_row, 900.0, "三心横排"),
+    "star":      (shape_star,      620.0, "五角星"),
+    "infinity":  (shape_infinity,  780.0, "无限符号 ∞"),
+    "spiral":    (shape_spiral,    520.0, "阿基米德螺旋"),
+    "nju":       (shape_nju,       640.0, "NJU 字母"),
+    "520":       (shape_520,       640.0, "520 数字"),
+}
+# 允许的旋转角：可辨识性优先，不能为了塞进边界就把图形躺倒
+ROTATIONS = {
+    "heart":     [-15, -10, -5, 0, 5, 10, 15],
+    "hearts":    [-15, -10, -5, 0, 5, 10, 15],
+    "heartnest": [-15, -10, -5, 0, 5, 10, 15],
+    "heartsrow": [-10, -5, 0, 5, 10],
+    "star":      [0],
+    "infinity":  [-10, -5, 0, 5, 10],
+    "spiral":    [0],
+    "nju":       [0],
+    "520":       [0],
+}
+
+
+def normalize(pts, size):
+    """等比缩放到最长边 = size，并平移到包围盒中心为原点。"""
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    w, h = max(xs) - min(xs), max(ys) - min(ys)
+    s = size / max(w, h)
+    cx, cy = (max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2
+    return [((x - cx) * s, (y - cy) * s) for (x, y) in pts]
+
+
+def rotate(pts, deg):
+    a = math.radians(deg)
+    ca, sa = math.cos(a), math.sin(a)
+    return [(x * ca - y * sa, x * sa + y * ca) for (x, y) in pts]
+
+
+def candidate_centers(poly, step=12):
+    """按到边界的距离排序列出候选中心点。"""
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    out = []
+    for i in range(0, int(max(xs) - min(xs)) + 1, step):
+        for j in range(0, int(max(ys) - min(ys)) + 1, step):
+            p = (min(xs) + i, min(ys) + j)
+            d = dist_to_poly(p, poly)
+            if d > 0:
+                out.append((d, p))
+    out.sort(key=lambda z: -z[0])
+    return out
+
+
+def local_maxima(cands, sep=110.0, limit=90):
+    picked = []
+    for d, p in cands:
+        if all((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 > sep * sep for _, q in picked):
+            picked.append((d, p))
+        if len(picked) >= limit:
+            break
+    return picked
+
+
+def best_placement(poly, shape_pts, name, need=60.0, avoid=None):
+    """在边界内找最优落点。
+
+    **正放优先**：爱心/五角星/字母这类图形歪着放很难看，所以倾斜只是
+    「正放的余量达不到 need，实在放不下」时的兜底，而不是拿来换余量的优化手段。
+    修正过一轮：早期按「余量最大」选，结果 149 m 余量的正放被 167 m 的 −15° 顶掉，
+    图形平白躺倒 —— 余量够用就不该动角度。
+    """
+    cands = local_maxima(candidate_centers(poly))
+    if avoid:
+        keep = [c for c in cands
+                if not any((c[1][0] - ax) ** 2 + (c[1][1] - ay) ** 2 < r * r
+                           for ax, ay, r in avoid)]
+        if keep:
+            cands = keep
+        else:
+            print("  提示: 避让条件下无可用落点，回退到全域最优位置")
+
+    def scan(rot):
+        rot_pts = rotate(shape_pts, rot)
+        bestm = None
+        for _, (cx, cy) in cands:
+            pts = [(x + cx, y + cy) for (x, y) in rot_pts]
+            m = min(dist_to_poly(p, poly) for p in pts)
+            if bestm is None or m > bestm[0]:
+                bestm = (m, cx, cy, pts)
+        return bestm
+
+    m0, cx0, cy0, pts0 = scan(0)
+    if m0 >= need:
+        return (m0, 0, cx0, cy0, pts0)
+
+    print("  正放余量 %.0f m 不足 %.0f m，试倾斜角" % (m0, need))
+    best = (m0, 0, cx0, cy0, pts0)
+    for rot in sorted(ROTATIONS.get(name, [0]), key=lambda r: (abs(r), r)):
+        if rot == 0:
+            continue
+        m, cx, cy, pts = scan(rot)
+        cand = (m, rot, cx, cy, pts)
+        if cand[0] - 0.8 * abs(rot) > best[0] - 0.8 * abs(best[1]):
+            best = cand
+    return best
+
+
+def path_len(pts):
+    return sum(math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
+               for i in range(1, len(pts)))
+
+
+def densify(pts_ll, step=5.0):
+    """沿线段按约 step 米加密采样（返回 (lon, lat) 点列）。
+
+    只校验顶点是不够的：字母/数字这类图形的「笔画间连直线」可能很长，
+    若多边形是凹的，那条直线可能穿出边界而顶点全在内 —— 必须沿线段采样。
+    """
+    if len(pts_ll) < 2:
+        return list(pts_ll)
+    out = [pts_ll[0]]
+    lon0 = pts_ll[0][0]
+    lat0 = pts_ll[0][1]
+    kx = m_per_deg_lon(lat0)
+    for i in range(1, len(pts_ll)):
+        ax, ay = pts_ll[i - 1]
+        bx, by = pts_ll[i]
+        dx = (bx - ax) * kx
+        dy = (by - ay) * M_PER_DEG
+        d = math.hypot(dx, dy)
+        n = max(1, int(d / step))
+        for j in range(1, n + 1):
+            f = j / float(n)
+            out.append((ax + (bx - ax) * f, ay + (by - ay) * f))
+    return out
+
+
+def write_geom_gpx(pts_ll, out):
+    """pts_ll 是 (lon, lat) —— GeoJSON 顺序，写进 GPX 时要换成 lat= 在前。"""
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write('<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="gpxart" '
+                 'xmlns="http://www.topografix.com/GPX/1/1">\n<trk><trkseg>\n')
+        for lon, lat in pts_ll:
+            fh.write('  <trkpt lat="%.7f" lon="%.7f"/>\n' % (lat, lon))
+        fh.write("</trkseg></trk>\n</gpx>\n")
+
+
+def read_gpx_ll(path):
+    import re
+    raw = open(path, encoding="utf-8", errors="ignore").read()
+    return [(float(b), float(a)) for a, b in
+            re.findall(r'lat="([-\d.]+)"\s+lon="([-\d.]+)"', raw)]
+
+
+def cmd_list(args):
+    print("可用图形：")
+    for k, (_, size, cn) in SHAPES.items():
+        print("  %-10s %-10s 默认最长边 %4.0f m" % (k, cn, size))
+    print()
+    print("示例: gpxart make --shape heart --boundary boundary.geojson -o heart.gpx")
+
+
+def cmd_make(args):
+    ring = read_boundary(args.boundary)
+    frame = Frame(ring)
+    poly = [frame.fwd(lo, la) for lo, la in ring]
+    area = abs(shoelace(poly)) / 1e6
+    fn, default_size, cn = SHAPES[args.shape]
+    size = args.size or default_size
+    shape_pts = normalize(fn(), size)
+    avoid = []
+    for spec in (args.avoid or []):
+        parts = [float(v) for v in spec.replace(" ", "").split(",")]
+        if len(parts) < 2:
+            sys.exit("--avoid 格式应为 LON,LAT 或 LON,LAT,RADIUS")
+        ax, ay = frame.fwd(parts[0], parts[1])
+        avoid.append((ax, ay, parts[2] if len(parts) > 2 else args.avoid_radius))
+    margin, rot, cx, cy, placed = best_placement(poly, shape_pts, args.shape,
+                                                need=max(args.margin, 0.0),
+                                                avoid=avoid)
+    clon, clat = frame.inv(cx, cy)
+    length = path_len(placed)
+    print("== %s（%s）==" % (cn, args.shape))
+    print("  边界        : %s  面积 %.2f km²" % (args.boundary, area))
+    print("  图形最长边  : %.0f m  旋转 %d°" % (size, rot))
+    print("  落点中心    : %.6f,%.6f" % (clat, clon))
+    print("  路径长度    : %.0f m (%.2f km)%s" % (
+        length, length / 1000.0,
+        "   ×%d 遍(%s) → 合计 %.2f km" % (
+            args.laps, args.laps_mode, length * args.laps / 1000.0) if args.laps > 1 else ""))
+    print("  离边界最小余量: %.0f m" % margin)
+    if margin <= 0:
+        sys.exit("  !! 图形越界了，把 --size 调小")
+    if args.margin and margin < args.margin:
+        sys.exit("  !! 最小余量 %.0f m 低于要求的 %d m，把 --size 调小" % (margin, args.margin))
+
+    pts_ll = [frame.inv(x, y) for (x, y) in placed]
+
+    # 只有天然闭合的图形才首尾相接；字母/螺旋这类开放笔画若强行闭合，
+    # 会多出一条横贯全图的收尾直线（实测让 NJU 从 1.83 km 虚增到 2.49 km）。
+    gap = math.hypot(placed[-1][0] - placed[0][0], placed[-1][1] - placed[0][1])
+    if gap < 25.0:
+        pts_ll.append(pts_ll[0])
+    else:
+        print("  开放笔画    : 首尾相距 %.0f m，不闭合" % gap)
+
+    b_lon = [p[0] for p in ring]
+    b_lat = [p[1] for p in ring]
+    off = [p for p in pts_ll
+           if not (min(b_lon) - 1e-4 <= p[0] <= max(b_lon) + 1e-4
+                   and min(b_lat) - 1e-4 <= p[1] <= max(b_lat) + 1e-4)]
+    if off:
+        sys.exit("  !! 自检失败：%d 个点的经纬度落在边界包围盒外（疑似 lon/lat 写反）"
+                 "  例: %.6f,%.6f" % (len(off), off[0][1], off[0][0]))
+
+    if not args.out:
+        sys.exit("缺少 -o 输出文件")
+    tmp = tempfile.mktemp(suffix=".gpx")
+    write_geom_gpx(pts_ll, tmp)
+    cmd = [RUNROUTE, "make", "--from-gpx", tmp, "--pace", args.pace,
+           "--laps", str(args.laps), "--laps-mode", args.laps_mode,
+           "--seed", str(args.seed), "-o", args.out]
+    if args.pace_ramp:
+        cmd += ["--pace-ramp", args.pace_ramp]
+    subprocess.run(cmd, check=True)
+    os.unlink(tmp)
+
+    if args.preview:
+        render_preview(ring, placed, frame, args.preview, "%s %s" % (cn, os.path.basename(args.out)))
+
+
+def render_preview(ring, placed_m, frame, out, title):
+    from PIL import Image, ImageDraw, ImageFont
+    W, H = 820, 1020
+    lons = [p[0] for p in ring]
+    lats = [p[1] for p in ring]
+    lo0, lo1 = min(lons), max(lons)
+    la0, la1 = min(lats), max(lats)
+    k = frame.k
+    pad = 34
+    sc = min((W - 2 * pad) / ((lo1 - lo0) * k), (H - 2 * pad) / ((la1 - la0) * M_PER_DEG))
+
+    def px(lo, la):
+        return (pad + (lo - lo0) * k * sc, H - pad - (la - la0) * M_PER_DEG * sc)
+
+    im = Image.new("RGB", (W, H), (16, 18, 22))
+    d = ImageDraw.Draw(im)
+    d.polygon([px(*p) for p in ring], fill=(26, 40, 56), outline=(120, 180, 230))
+    pts = [px(*frame.inv(x, y)) for (x, y) in placed_m]
+    d.line(pts, fill=(255, 170, 60), width=5, joint="curve")
+    d.ellipse([pts[0][0] - 8, pts[0][1] - 8, pts[0][0] + 8, pts[0][1] + 8], fill=(80, 220, 140))
+    try:
+        f1 = ImageFont.truetype("/System/Library/Fonts/Hiragino Sans GB.ttc", 22)
+        f2 = ImageFont.truetype("/System/Library/Fonts/Hiragino Sans GB.ttc", 17)
+    except Exception:
+        f1 = f2 = None
+    d.text((pad, 12), title, fill=(235, 240, 250), font=f1)
+    d.text((pad, H - 26), "蓝=校区边界  橙=轨迹  绿=起点", fill=(150, 170, 195), font=f2)
+    im.save(out)
+    print("  预览图      : %s" % out)
+
+
+def cmd_check(args):
+    ring = read_boundary(args.boundary)
+    frame = Frame(ring)
+    poly = [frame.fwd(lo, la) for lo, la in ring]
+    pts = read_gpx_ll(args.gpx)
+    if not pts:
+        sys.exit("读不到 GPX 坐标: %s" % args.gpx)
+    dense = densify(pts, args.step)
+    ds = [dist_to_poly(frame.fwd(lo, la), poly) for lo, la in dense]
+    bad = sum(1 for d in ds if d < 0)
+    print("== 越界校验 ==")
+    print("  文件      : %s" % args.gpx)
+    print("  顶点数    : %d（沿线段每 %.0f m 加密到 %d 点）" % (len(pts), args.step, len(dense)))
+    print("  越界点数  : %d" % bad)
+    print("  离边界最近: %.0f m" % min(ds))
+    print("  离边界最远: %.0f m" % max(ds))
+    if bad:
+        sys.exit("  !! 有 %d 个点越界" % bad)
+    if args.margin and min(ds) < args.margin:
+        sys.exit("  !! 最近点余量 %.0f m < 要求 %d m" % (min(ds), args.margin))
+    print("  结论      : 全部在边界内 ✓")
+
+
+def fmt_pace(sec_per_km):
+    if not sec_per_km or sec_per_km <= 0 or sec_per_km > 35999:
+        return "--'--\""
+    m, s = divmod(int(round(sec_per_km)), 60)
+    return "%d'%02d\"" % (m, s)
+
+
+def fmt_hms(seconds):
+    seconds = int(round(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return ("%dh%02dm%02ds" if h else "%dm%02ds") % ((h, m, s) if h else (m, s))
+
+
+def fmt_len(meters):
+    return "%.2f km" % (meters / 1000.0)
+
+
+def read_gpx_timed(path):
+    """读 GPX，返回 ([(lon, lat)...], [epoch 秒...])，用来算逐点配速。"""
+    import re
+    from datetime import datetime
+    pts, ts = [], []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            m = re.search(r'<trkpt\s+lat="([-\d.]+)"\s+lon="([-\d.]+)"', line)
+            if not m:
+                continue
+            la, lo = float(m.group(1)), float(m.group(2))
+            t = 0.0
+            tm = re.search(r"<time>([^<]+)</time>", line)
+            if tm:
+                t = datetime.fromisoformat(tm.group(1).replace("Z", "+00:00")).timestamp()
+            pts.append((lo, la))
+            ts.append(t)
+    return pts, ts
+
+
+# 配速色带：慢(蓝) -> 快(红)。与国内运动 App 的配速热力图习惯一致。
+PACE_STOPS = [(0.00, (46, 123, 232)), (0.25, (35, 196, 176)), (0.50, (126, 217, 87)),
+              (0.75, (255, 199, 56)), (1.00, (255, 90, 60))]
+
+
+def pace_color(u):
+    u = 0.0 if u < 0 else (1.0 if u > 1 else u)
+    for i in range(1, len(PACE_STOPS)):
+        u0, c0 = PACE_STOPS[i - 1]
+        u1, c1 = PACE_STOPS[i]
+        if u <= u1:
+            f = 0.0 if u1 == u0 else (u - u0) / (u1 - u0)
+            return tuple(int(round(c0[j] + (c1[j] - c0[j]) * f)) for j in range(3))
+    return PACE_STOPS[-1][1]
+
+
+def cmd_paint(args):
+    """把 GPX 按「逐点配速」上色画出来 —— 用来判断配速彩带好不好看。"""
+    from PIL import Image, ImageDraw, ImageFont
+    ring = read_boundary(args.boundary)
+    frame = Frame(ring)
+    pts, ts = read_gpx_timed(args.gpx)
+    n = len(pts)
+    if n < 3:
+        sys.exit("读不到足够的点: %s" % args.gpx)
+
+    mx = [frame.fwd(lo, la) for lo, la in pts]
+    seg = [0.0] + [math.hypot(mx[i][0] - mx[i - 1][0], mx[i][1] - mx[i - 1][1])
+                   for i in range(1, n)]
+    dt = [0.0] + [max(0.0, ts[i] - ts[i - 1]) for i in range(1, n)]
+
+    # 窗口内「总距离 / 总用时」求速度：对 dt=0 的点天然稳健，也压掉逐秒抖动
+    W = max(1, args.smooth_window)
+    pace = [None] * n
+    for i in range(n):
+        a, b = max(0, i - W), min(n - 1, i + W)
+        dist = sum(seg[a + 1:b + 1])
+        secs = sum(dt[a + 1:b + 1])
+        pace[i] = secs / (dist / 1000.0) if dist > 1.0 and secs > 0 else None
+    known = [p for p in pace if p]
+    if len(known) < 2:
+        sys.exit("算不出配速（时间戳缺失？）")
+    last = known[0]
+    for i in range(n):
+        if pace[i] is None:
+            pace[i] = last
+        else:
+            last = pace[i]
+
+    srt = sorted(known)
+    lo_p = srt[int(0.05 * (len(srt) - 1))]
+    hi_p = srt[int(0.95 * (len(srt) - 1))]
+
+    def u_of(p):
+        if hi_p - lo_p < 1e-6:
+            return 0.5
+        return 1.0 - (p - lo_p) / (hi_p - lo_p)      # 越快(秒数越小) u 越大 -> 越红
+
+    W_, H_ = 860, 1060
+    pad, legend_h = 36, 78
+    lons = [p[0] for p in ring]
+    lats = [p[1] for p in ring]
+    lo0, lo1, la0, la1 = min(lons), max(lons), min(lats), max(lats)
+    sc = min((W_ - 2 * pad) / ((lo1 - lo0) * frame.k),
+             (H_ - 2 * pad - legend_h) / ((la1 - la0) * M_PER_DEG))
+
+    def px(lo, la):
+        return (pad + (lo - lo0) * frame.k * sc,
+                H_ - pad - legend_h - (la - la0) * M_PER_DEG * sc)
+
+    im = Image.new("RGB", (W_, H_), (16, 18, 22))
+    d = ImageDraw.Draw(im)
+    d.polygon([px(*p) for p in ring], fill=(24, 34, 46), outline=(96, 140, 180))
+    line = [px(*p) for p in pts]
+    lw = args.width
+    for i in range(1, n):
+        d.line([line[i - 1], line[i]], fill=pace_color(u_of(pace[i])), width=lw)
+    for p, col in ((line[0], (255, 255, 255)), (line[-1], (255, 255, 255))):
+        d.ellipse([p[0] - lw, p[1] - lw, p[0] + lw, p[1] + lw], outline=col, width=3)
+    try:
+        f1 = ImageFont.truetype("/System/Library/Fonts/Hiragino Sans GB.ttc", 22)
+        f2 = ImageFont.truetype("/System/Library/Fonts/Hiragino Sans GB.ttc", 17)
+    except Exception:
+        f1 = f2 = None
+
+    dur = ts[-1] - ts[0]
+    d.text((pad, 12), args.title or ("配速彩带 · %s" % os.path.basename(args.gpx)),
+           fill=(236, 241, 250), font=f1)
+    d.text((pad, 44), "全程 %s   平均配速 %s   快慢 %.0fs"
+           % (fmt_len(sum(seg)), fmt_pace(sum(dt) / (sum(seg) / 1000.0)), hi_p - lo_p),
+           fill=(150, 172, 198), font=f2)
+
+    # 图例
+    yb = H_ - 48
+    d.text((pad, yb - 26), "慢 %s" % fmt_pace(hi_p), fill=(150, 172, 198), font=f2)
+    d.text((pad + 150, yb - 26), "快 %s" % fmt_pace(lo_p), fill=(150, 172, 198), font=f2)
+    bar_w = 300
+    for i in range(bar_w):
+        d.line([(pad + i, yb), (pad + i, yb + 14)], fill=pace_color(i / (bar_w - 1.0)))
+    d.rectangle([pad - 1, yb - 1, pad + bar_w, yb + 15], outline=(90, 100, 115))
+    d.text((pad + bar_w + 16, yb - 2), "白圈 = 起终点", fill=(150, 172, 198), font=f2)
+    im.save(args.out)
+    print("== 配速彩带预览 ==")
+    print("  GPX       : %s" % args.gpx)
+    print("  点数      : %d   时长 %s" % (n, fmt_hms(dur)))
+    print("  距离      : %.0f m   平均配速 %s"
+          % (sum(seg), fmt_pace(sum(dt) / (sum(seg) / 1000.0))))
+    print("  配速范围  : %s ~ %s（色带映射取 P5~P95）"
+          % (fmt_pace(lo_p), fmt_pace(hi_p)))
+    print("  输出      : %s" % args.out)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="gpxart", description="在边界内生成图形运动轨迹 GPX")
+    sub = p.add_subparsers(dest="command")
+    sub.add_parser("list", help="列出可用图形").set_defaults(func=cmd_list)
+
+    m = sub.add_parser("make", help="生成图形 GPX")
+    m.add_argument("--shape", required=True, choices=sorted(SHAPES))
+    m.add_argument("--boundary", required=True, help="边界 GeoJSON")
+    m.add_argument("--size", type=float, help="图形最长边（米），默认按图形类型")
+    m.add_argument("--pace", default="6:00", help="配速 MM:SS（默认 6:00）")
+    m.add_argument("--pace-ramp", metavar="SLOW,FAST",
+                   help="配速斜坡（如 7:30,4:30）：由慢到快，让 App 的配速彩带形成渐变，"
+                        "轨迹会更好看；平均配速取两端平均")
+    m.add_argument("--seed", type=int, default=42)
+    m.add_argument("--margin", type=float, default=60.0, help="要求的最小离边界余量（米）")
+    m.add_argument("--avoid", action="append", metavar="LON,LAT[,R]",
+                   help="避开已有落点（可重复），默认避让半径见 --avoid-radius")
+    m.add_argument("--avoid-radius", type=float, default=320.0, help="--avoid 的默认避让半径（米）")
+    m.add_argument("--preview", help="输出预览 PNG")
+    m.add_argument("--laps", type=int, default=1,
+                   help="重复遍数：用短图形凑目标距离（默认 1）")
+    m.add_argument("--laps-mode", choices=("forward", "retrace"), default="retrace",
+                   help="重复方式：retrace=到终点原路跑回起点（往复，默认）；"
+                        "forward=同方向重复，圈间以回直线衔接")
+    m.add_argument("-o", "--out", help="输出 GPX")
+    m.set_defaults(func=cmd_make)
+
+    c = sub.add_parser("check", help="校验 GPX 是否全在边界内")
+    c.add_argument("--boundary", required=True)
+    c.add_argument("--gpx", required=True)
+    c.add_argument("--margin", type=float, default=0.0)
+    c.add_argument("--step", type=float, default=5.0,
+                   help="沿线段加密采样的步长（米），默认 5 —— 只查顶点会漏掉长连线穿界")
+    c.set_defaults(func=cmd_check)
+
+    q = sub.add_parser("paint", help="按配速上色画出 GPX（看彩带效果）")
+    q.add_argument("--boundary", required=True)
+    q.add_argument("--gpx", required=True)
+    q.add_argument("--smooth-window", type=int, default=4,
+                   help="配速平滑窗口（秒，默认 4）")
+    q.add_argument("--width", type=int, default=6, help="轨迹线宽（像素，默认 6）")
+    q.add_argument("--title", help="图标题")
+    q.add_argument("-o", "--out", default="pace.png")
+    q.set_defaults(func=cmd_paint)
+    return p
+
+
+def main():
+    ap = build_parser()
+    args = ap.parse_args()
+    if not getattr(args, "command", None):
+        ap.print_help()
+        return 1
+    args.func(args)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

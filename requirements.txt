@@ -1,0 +1,6 @@
+# 核心依赖：落点搜索用 numpy 加速（纯标准库版本慢 8~25 倍，实时预览扛不住）
+numpy>=1.24
+
+# 真机定位注入才需要，纯画图/生成 GPX 可以不装：
+#   pip install pymobiledevice3
+# pymobiledevice3>=4.0

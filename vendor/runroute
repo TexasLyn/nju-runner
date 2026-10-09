@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+runroute - 生成 / 校验 / 播放运动轨迹 GPX（配合 pymobiledevice3 的 DVT 定位注入）
+
+为什么要这个工具：
+  pymobiledevice3 的 `simulate-location play` 按 GPX 里的 <time> 原速回放。
+  网上抓到的 GPX 路线几乎都没有 <time>，直接播放会「瞬间推完」（实测总时长 0 秒），
+  运动 App 记录到的配速完全失控。本工具把「几何路线」和「配速时间」解耦：
+  先拿形状，再按你给的配速重采样成每秒一个点，补上时间戳。
+
+用法:
+  runroute make --circle 32.0570,118.7788:150 --laps 4 --pace 6:00 -o circle.gpx
+  runroute make --from-gpx raw.gpx --pace 6:00 -o fixed.gpx
+  runroute make --line 32.0570,118.7788 32.0620,118.7830 --pace 5:30 -o line.gpx
+  runroute info fixed.gpx
+  runroute play fixed.gpx
+
+注意:
+  play 是阻塞式的，必须在你自己的终端里跑（后台执行会被环境回收，位置随即回滚）。
+"""
+import argparse
+import math
+import os
+import random
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+
+PMD = "/Users/texas/.workbuddy/binaries/python/envs/default/bin/pymobiledevice3"
+M_PER_DEG_LAT = 111320.0
+
+
+def m_per_deg_lon(lat):
+    return M_PER_DEG_LAT * math.cos(math.radians(lat))
+
+
+def haversine(lat1, lon1, lat2, lon2):
+    radius = 6371008.8
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = p2 - p1
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * radius * math.asin(math.sqrt(a))
+
+
+def parse_pace(text):
+    if ":" in text:
+        minute, second = text.split(":")
+        return int(minute) * 60 + float(second)
+    return float(text)
+
+
+def fmt_pace(sec_per_km):
+    minute = int(sec_per_km // 60)
+    second = int(round(sec_per_km - minute * 60))
+    if second == 60:
+        minute, second = minute + 1, 0
+    return "%d'%02d\"/km" % (minute, second)
+
+
+def fmt_hms(seconds):
+    seconds = int(round(seconds))
+    hour, rest = divmod(seconds, 3600)
+    minute, second = divmod(rest, 60)
+    if hour:
+        return "%dh%02dm%02ds" % (hour, minute, second)
+    return "%dm%02ds" % (minute, second)
+
+
+def parse_latlon(text):
+    parts = text.split(",")
+    return float(parts[0]), float(parts[1])
+
+
+class Smooth:
+    """平滑随机游走：模拟 GPS 漂移和配速波动（相邻点相关，不是白噪声）。"""
+
+    def __init__(self, amp, retain=0.9, sigma_ratio=0.35, seed=None):
+        self.amp = float(amp)
+        self.retain = retain
+        self.sigma = self.amp * sigma_ratio
+        self.rng = random.Random(seed)
+        self.value = 0.0
+
+    def next(self):
+        self.value = self.value * self.retain + self.rng.gauss(0.0, self.sigma)
+        if self.value > self.amp:
+            self.value = self.amp
+        elif self.value < -self.amp:
+            self.value = -self.amp
+        return self.value
+
+
+def gen_circle(center, radius_m, laps):
+    """椭圆环线 + 轻微不规则，避免一眼假。"""
+    clat, clon = center
+    per_lap = max(120, int(2 * math.pi * radius_m))
+    pts = []
+    for i in range(per_lap * laps + 1):
+        t = 2 * math.pi * i / per_lap
+        r = radius_m * (1 + 0.05 * math.sin(3 * t + 0.7) + 0.03 * math.sin(5 * t + 2.1))
+        pts.append((clat + r * math.cos(t) / M_PER_DEG_LAT,
+                    clon + r * math.sin(t) / m_per_deg_lon(clat)))
+    return pts
+
+
+def gen_line(a, b, n=256):
+    return [(a[0] + (b[0] - a[0]) * i / n, a[1] + (b[1] - a[1]) * i / n) for i in range(n + 1)]
+
+
+def gen_polyline(waypoints, laps, laps_mode="forward"):
+    pts = []
+    for lap in range(laps):
+        seq = (waypoints if (laps_mode == "forward" or lap % 2 == 0)
+               else list(reversed(waypoints)))
+        for i in range(len(seq) - 1):
+            seg = gen_line(seq[i], seq[i + 1], max(32, int(
+                haversine(seq[i][0], seq[i][1], seq[i + 1][0], seq[i + 1][1]) / 5)))
+            pts.extend(seg[:-1] if i < len(seq) - 2 else seg)
+    return pts
+
+
+def repeat_points(path, laps, laps_mode="retrace"):
+    """把现成点列重复 laps 遍，用于把短轨迹拉到目标距离（GPS 作画）。
+
+    retrace（默认）: 单双圈反向 —— 到终点后原路跑回起点，圈间无连线，
+                     图形笔画不会被多余直线污染（往复跑）。
+    forward       : 每圈都按同一方向走，圈与圈之间由一条「回起点的直连线」衔接
+                     —— 不折返，但那条连直线会出现在轨迹里。
+    """
+    path = list(path)
+    if laps <= 1:
+        return path
+    out = []
+    for lap in range(laps):
+        seq = (path if (laps_mode == "forward" or lap % 2 == 0)
+               else list(reversed(path)))
+        out.extend(seq if lap == 0 else seq[1:])   # 衔接点与前一圈末点重合，去重
+    return out
+
+
+def read_gpx_points(path):
+    """读 GPX 的经纬度序列。优先用 gpxpy，退化到正则。"""
+    try:
+        import gpxpy
+        with open(path, "r", encoding="utf-8") as fh:
+            gpx = gpxpy.parse(fh)
+        pts = []
+        for trk in gpx.tracks:
+            for seg in trk.segments:
+                for p in seg.points:
+                    pts.append((p.latitude, p.longitude))
+        if pts:
+            return pts
+    except Exception:
+        pass
+    import re
+    raw = open(path, "r", encoding="utf-8", errors="ignore").read()
+    return [(float(a), float(b)) for a, b in re.findall(r'lat="([-\d.]+)"\s+lon="([-\d.]+)"', raw)]
+
+
+def resample(path, speed_mps, jitter_m=0.0, pace_noise=0.0, seed=None, pace_ramp=None):
+    """沿几何路线行走，重采样成轨迹点。
+
+    步长由目标速度与配速波动决定；**时间由「抖动后的实际位移」累加得到**，
+    因此 GPS 漂移带来的距离膨胀不会让配速虚快 —— App 记录到的平均配速
+    会等于你给的目标配速。
+
+    pace_ramp=(起点配速秒, 终点配速秒)：按**已走距离的比例**线性变速，用来让
+    运动 App 的配速彩带形成渐变（慢→快）。注意是「按距离」而不是「按时间」，
+    这样颜色才会跟着图形位置走；因为配速对距离线性，平均配速恰好 = 两端均值。
+
+    返回 (points, geometric_total_m)，points 元素为 (lat, lon, elapsed_seconds)。
+    """
+    cum = [0.0]
+    for i in range(1, len(path)):
+        cum.append(cum[-1] + haversine(path[i - 1][0], path[i - 1][1], path[i][0], path[i][1]))
+    total = cum[-1]
+    if total <= 0:
+        raise ValueError("路线长度为 0，无法生成轨迹")
+
+    lat_noise = Smooth(jitter_m, retain=0.97, sigma_ratio=0.12, seed=seed) if jitter_m > 0 else None
+    lon_noise = Smooth(jitter_m, retain=0.97, sigma_ratio=0.12, seed=(seed or 0) + 1) if jitter_m > 0 else None
+    sp_noise = Smooth(pace_noise, retain=0.9, sigma_ratio=0.3, seed=(seed or 0) + 2) if pace_noise > 0 else None
+
+    out = []
+    elapsed = 0.0
+    walked = 0.0
+    prev = None
+    idx = 1
+    while walked <= total:
+        if pace_ramp is None:
+            inst = speed_mps
+        else:
+            u = min(1.0, walked / total)
+            a, b = pace_ramp
+            inst = 1000.0 / (a + (b - a) * u)
+        if sp_noise is not None:
+            inst *= 1.0 + sp_noise.next()
+        if inst < 0.4:
+            inst = 0.4
+        while idx < len(cum) and cum[idx] < walked:
+            idx += 1
+        if idx >= len(cum):
+            lat, lon = path[-1]
+        else:
+            seg = cum[idx] - cum[idx - 1]
+            frac = 0.0 if seg <= 0 else (walked - cum[idx - 1]) / seg
+            lat = path[idx - 1][0] + (path[idx][0] - path[idx - 1][0]) * frac
+            lon = path[idx - 1][1] + (path[idx][1] - path[idx - 1][1]) * frac
+        if lat_noise is not None:
+            lat += lat_noise.next() / M_PER_DEG_LAT
+            lon += lon_noise.next() / m_per_deg_lon(lat)
+        if prev is not None:
+            elapsed += haversine(prev[0], prev[1], lat, lon) / inst
+        prev = (lat, lon)
+        out.append((lat, lon, elapsed))
+        walked += inst
+    return out, total
+
+
+def write_gpx(points, out_path, name, start_dt, time_scale=1.0):
+    lines = ['<?xml version="1.0" encoding="UTF-8"?>',
+             '<gpx version="1.1" creator="runroute" xmlns="http://www.topografix.com/GPX/1/1">',
+             '  <metadata><name>%s</name><time>%s</time></metadata>' % (
+                 name, start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")),
+             '  <trk><name>%s</name><trkseg>' % name]
+    for lat, lon, elapsed in points:
+        stamp = start_dt + timedelta(seconds=elapsed / time_scale)
+        lines.append('    <trkpt lat="%.7f" lon="%.7f"><time>%s</time></trkpt>' % (
+            lat, lon, stamp.strftime("%Y-%m-%dT%H:%M:%SZ")))
+    lines.append('  </trkseg></trk>')
+    lines.append('</gpx>')
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def gpx_stats(path):
+    """统计 GPX：点数、几何距离、时长、平均配速、时间戳完整性。"""
+    try:
+        import gpxpy
+        with open(path, "r", encoding="utf-8") as fh:
+            gpx = gpxpy.parse(fh)
+        pts, times, timed = [], [], True
+        for trk in gpx.tracks:
+            for seg in trk.segments:
+                for p in seg.points:
+                    pts.append((p.latitude, p.longitude))
+                    if p.time is None:
+                        timed = False
+                    else:
+                        times.append(p.time)
+        if not pts:
+            raise ValueError("no points")
+    except Exception:
+        pts = read_gpx_points(path)
+        return {"points": len(pts), "distance": _dist(pts), "timed": None,
+                "duration": None, "note": "gpxpy 解析失败，仅统计几何"}
+
+    distance = _dist(pts)
+    duration = None
+    if timed and len(times) >= 2:
+        duration = (times[-1] - times[0]).total_seconds()
+    return {"points": len(pts), "distance": distance, "timed": timed,
+            "duration": duration, "start": times[0] if times else None}
+
+
+def _dist(pts):
+    return sum(haversine(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1])
+               for i in range(1, len(pts)))
+
+
+def report(gpx_path, title):
+    st = gpx_stats(gpx_path)
+    print("== %s ==" % title)
+    print("  文件        : %s" % gpx_path)
+    print("  点数        : %d" % st["points"])
+    print("  几何距离    : %.0f 米 (%.2f 公里)" % (st["distance"], st["distance"] / 1000.0))
+    if st.get("duration"):
+        print("  回放时长    : %s" % fmt_hms(st["duration"]))
+        if st["distance"] > 0:
+            print("  记录配速    : %s" % fmt_pace(st["duration"] / (st["distance"] / 1000.0)))
+    elif st.get("timed") is False:
+        print("  回放时长    : 0 秒  <-- 缺 <time>，播放会瞬间推完！用 make --from-gpx 补时间戳")
+    if st.get("start"):
+        print("  起始时间    : %s UTC" % st["start"].strftime("%Y-%m-%d %H:%M:%S"))
+    return st
+
+
+def cmd_make(args):
+    pace_sec = parse_pace(args.pace)
+    ramp = None
+    if args.pace_ramp:
+        raw = args.pace_ramp.replace("，", ",").replace(" ", ",")
+        parts = [p for p in raw.split(",") if p.strip()]
+        if len(parts) != 2:
+            sys.exit("--pace-ramp 格式应为 起点配速,终点配速，例如 --pace-ramp 7:30,4:30")
+        ramp = (parse_pace(parts[0]), parse_pace(parts[1]))
+        pace_sec = (ramp[0] + ramp[1]) / 2.0     # 配速对距离线性 → 均值就是两端平均
+    speed_mps = 1000.0 / pace_sec
+    start_dt = (datetime.strptime(args.start, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                if args.start else datetime.now(timezone.utc).replace(microsecond=0))
+
+    if args.circle:
+        spec = args.circle
+        if ":" not in spec:
+            sys.exit("--circle 格式应为 LAT,LON:RADIUS，例如 32.0570,118.7788:150")
+        coords, radius = spec.rsplit(":", 1)
+        center = parse_latlon(coords)
+        path = gen_circle(center, float(radius), args.laps)
+        name = "circle r=%sm x%s" % (radius, args.laps)
+    elif args.line:
+        if len(args.line) != 2:
+            sys.exit("--line 需要两个坐标：--line LAT,LON LAT,LON")
+        path = gen_line(parse_latlon(args.line[0]), parse_latlon(args.line[1]))
+        name = "line"
+    elif args.from_gpx:
+        path = read_gpx_points(args.from_gpx)
+        if len(path) < 2:
+            sys.exit("从 %s 读不到足够的坐标点" % args.from_gpx)
+        path = repeat_points(path, args.laps, args.laps_mode)
+        name = "from %s" % os.path.basename(args.from_gpx)
+        if args.laps > 1:
+            name += " x%d(%s)" % (args.laps, args.laps_mode)
+    elif args.path:
+        waypoints = [parse_latlon(x) for x in args.path.replace(";", " ").split() if x.strip()]
+        if len(waypoints) < 2:
+            sys.exit("--path 至少需要两个坐标，用分号或空格分隔")
+        path = gen_polyline(waypoints, args.laps, args.laps_mode)
+        name = "path x%s" % args.laps
+    else:
+        sys.exit("需要 --circle / --line / --from-gpx / --path 之一（用 -h 看用法）")
+
+    points, geo_total = resample(path, speed_mps, jitter_m=args.jitter,
+                                 pace_noise=args.pace_noise, seed=args.seed,
+                                 pace_ramp=ramp)
+    if not args.out:
+        sys.exit("缺少 -o 输出文件")
+    write_gpx(points, args.out, name, start_dt, time_scale=args.speed_factor)
+
+    print("== 已生成 ==")
+    print("  路线        : %s" % name)
+    print("  几何距离    : %.0f 米 (%.2f 公里)" % (geo_total, geo_total / 1000.0))
+    recorded = _dist([(p[0], p[1]) for p in points])
+    print("  记录距离    : %.0f 米  (含 GPS 漂移，App 看到的就是这个)" % recorded)
+    print("  点数        : %d" % len(points))
+    real_dur = points[-1][2]
+    print("  目标配速    : %s" % fmt_pace(pace_sec))
+    if ramp:
+        print("  配速斜坡    : %s → %s（%s），按距离线性"
+              % (fmt_pace(ramp[0]), fmt_pace(ramp[1]),
+                 "由慢到快" if ramp[0] > ramp[1] else "由快到慢"))
+    if recorded > 0:
+        print("  实际配速    : %s" % fmt_pace(real_dur / (recorded / 1000.0)))
+    print("  回放时长    : %s" % fmt_hms(real_dur / args.speed_factor))
+    if args.speed_factor != 1.0:
+        eff = pace_sec / args.speed_factor
+        print("  时间缩放    : x%.2f  -> App 会记录约 %s" % (args.speed_factor, fmt_pace(eff)))
+    print("  GPS 漂移    : ±%.1f 米" % args.jitter)
+    print("  配速波动    : ±%.0f%%" % (args.pace_noise * 100))
+    print("  输出        : %s" % args.out)
+    print()
+    print("  下一步: runroute play %s" % args.out)
+    print("  提醒: 这是阻塞式回放，必须在你自己终端里跑，中途别拔线。")
+
+
+def cmd_info(args):
+    report(args.file, "轨迹信息")
+    print()
+    print("  提示: 回放时长就是你要挂机的时间（原速回放，无调速参数）。")
+
+
+def cmd_play(args):
+    if not os.path.exists(PMD):
+        sys.exit("找不到 pymobiledevice3: %s" % PMD)
+    st = gpx_stats(args.file)
+    if st.get("timed") is False:
+        print("警告: 该 GPX 没有 <time>，回放会瞬间推完（约 0 秒）。", file=sys.stderr)
+        print("      建议先: runroute make --from-gpx %s --pace 6:00 -o fixed.gpx" % args.file,
+              file=sys.stderr)
+    if st.get("duration"):
+        print("即将回放 %s（约 %s）。Ctrl+C 停止。" % (args.file, fmt_hms(st["duration"])))
+    cmd = [PMD, "developer", "dvt", "simulate-location", "play", args.file]
+    if args.randomness:
+        cmd.append(str(args.randomness))
+        print("注意: 你启用了 --timing-randomness %d ms —— 它会二次扰动配速，"
+              "配速抖动过大会显得不自然。" % args.randomness, file=sys.stderr)
+    if args.dry_run:
+        print("dry-run，实际命令:\n  " + " ".join(cmd))
+        return
+    try:
+        subprocess.run(cmd)
+    except KeyboardInterrupt:
+        print("\n已中断（注意：硬中断下画的状态可能残留在设备侧）。")
+    finally:
+        if not args.keep:
+            clear_location()
+            print(HARD_RESET_HINT)
+
+
+HARD_RESET_HINT = (
+    "提示: 以上只是「请求」设备停止模拟 —— 实测 clear 会返回 0 却仍不生效，\n"
+    "      因为底层 stopLocationSimulation 是 expects_reply=False（发出即忘、无回执）。\n"
+    "      若手机地图仍显示模拟位置，**拔掉数据线**（或重启设备）是唯一可靠的恢复方式。"
+)
+
+
+def clear_location():
+    if not os.path.exists(PMD):
+        return
+    subprocess.run([PMD, "developer", "dvt", "simulate-location", "clear"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cmd_clear(args):
+    clear_location()
+    print(HARD_RESET_HINT)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="runroute",
+        description="生成 / 校验 / 播放运动轨迹 GPX（配合 pymobiledevice3 注入）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="示例:\n"
+               "  runroute make --circle 32.0570,118.7788:150 --laps 4 --pace 6:00 -o c.gpx\n"
+               "  runroute make --from-gpx raw.gpx --pace 5:30 -o f.gpx\n"
+               "  runroute make --from-gpx short.gpx --laps 2 -o f2.gpx   # 同方向重复 2 遍\n"
+               "  runroute info f.gpx\n"
+               "  runroute play f.gpx\n")
+    sub = parser.add_subparsers(dest="command")
+
+    p = sub.add_parser("make", help="生成带时间戳的 GPX 轨迹")
+    p.add_argument("--circle", metavar="LAT,LON:RADIUS", help="环线：中心点与半径（米）")
+    p.add_argument("--line", nargs=2, metavar=("FROM", "TO"), help="直线：起终点 LAT,LON")
+    p.add_argument("--from-gpx", metavar="FILE", help="读入现有 GPX，按配速补时间戳与漂移")
+    p.add_argument("--path", metavar="COORDS", help="折线：'lat,lon lat,lon ...' （分号或空格分隔）")
+    p.add_argument("--laps", type=int, default=1,
+                   help="圈数（circle / path / from-gpx 都支持，默认 1）")
+    p.add_argument("--laps-mode", choices=("forward", "retrace"), default="retrace",
+                   help="多圈衔接方式：retrace=到终点原路跑回起点（往复，默认，圈间无连线）；"
+                        "forward=同方向重复，圈间以一条回起点的直线衔接")
+    p.add_argument("--pace", default="6:00", help="目标配速 MM:SS 每公里（默认 6:00）")
+    p.add_argument("--pace-ramp", metavar="SLOW,FAST",
+                   help="配速斜坡：起点配速,终点配速（如 7:30,4:30），按距离线性变速，"
+                        "用于让运动 App 的配速彩带形成渐变。给出后 --pace 仅作兜底，"
+                        "平均配速 = 两端平均")
+    p.add_argument("--jitter", type=float, default=2.5, help="GPS 漂移幅度，米（默认 2.5，0=关闭）")
+    # 注意：argparse 会把 help 当 % 格式化模板，裸 % 会让 `make -h` 直接崩，必须写 %%
+    p.add_argument("--pace-noise", type=float, default=0.08,
+                   help="配速波动比例（默认 0.08，即 ±8%%）")
+    p.add_argument("--speed-factor", type=float, default=1.0,
+                   help="时间缩放：>1 快放（App 记录的配速同比变快），默认 1.0")
+    p.add_argument("--start", help="起始时间 UTC，格式 2026-09-21T12:00:00（默认现在）")
+    p.add_argument("--seed", type=int, help="随机种子（固定后轨迹可复现）")
+    p.add_argument("-o", "--out", help="输出 GPX 路径")
+    p.set_defaults(func=cmd_make)
+
+    p = sub.add_parser("info", help="查看 GPX 的距离/时长/配速")
+    p.add_argument("file")
+    p.set_defaults(func=cmd_info)
+
+    p = sub.add_parser("play", help="回放到设备（阻塞，需真实时长）")
+    p.add_argument("file")
+    p.add_argument("--randomness", type=int, default=0,
+                   help="pymobiledevice3 的 timing-randomness（毫秒），默认 0，一般别开")
+    p.add_argument("--dry-run", action="store_true", help="只打印命令不执行")
+    p.add_argument("--keep", action="store_true",
+                   help="回放结束后不自动 clear（默认会自动清，避免设备侧残留）")
+    p.set_defaults(func=cmd_play)
+
+    p = sub.add_parser("clear", help="清除模拟定位，设备回真实位置")
+    p.set_defaults(func=cmd_clear)
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    if not getattr(args, "command", None):
+        parser.print_help()
+        return 1
+    args.func(args)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

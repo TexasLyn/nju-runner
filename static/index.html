@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NJU Runner · 南哪跑男</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23ff8b28'/%3E%3Cstop offset='1' stop-color='%23ff5f6d'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath d='M16 28S4 19.6 4 11.9C4 7.7 7.2 5 10.4 5c2.3 0 4.3 1.3 5.6 3.4C17.3 6.3 19.3 5 21.6 5 24.8 5 28 7.7 28 11.9 28 19.6 16 28 16 28z' fill='url(%23g)'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+<script>
+  // 主题要在首帧前定下来，否则会闪一下白底。
+  (function () {
+    var t = null;
+    try { t = localStorage.getItem("njurunner.theme"); } catch (e) {}
+    if (t !== "dark" && t !== "light") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  })();
+</script>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo"></span>
+    <h1>NJU Runner<span>南哪跑男</span></h1>
+    <p class="sub">在校园边界内画图形轨迹，一键注入到手机</p>
+  </div>
+  <div class="dev" id="dev">
+    <span class="dot"></span><span id="devtext">检查设备…</span>
+  </div>
+  <button class="theme" id="btnTheme" type="button" aria-label="切换深色模式" title="切换深色模式">
+    <svg class="ic ic-moon" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M20.7 13.6A8.6 8.6 0 1 1 10.4 3.3a6.8 6.8 0 0 0 10.3 10.3z" fill="currentColor"/>
+    </svg>
+    <svg class="ic ic-sun" viewBox="0 0 24 24" aria-hidden="true">
+      <circle cx="12" cy="12" r="4.1" fill="currentColor"/>
+      <g stroke="currentColor" stroke-width="1.9" stroke-linecap="round">
+        <path d="M12 2.7v2.3M12 19v2.3M2.7 12h2.3M19 12h2.3M5.5 5.5l1.6 1.6M16.9 16.9l1.6 1.6M18.5 5.5l-1.6 1.6M7.1 16.9l-1.6 1.6"/>
+      </g>
+    </svg>
+  </button>
+</header>
+
+<main>
+  <aside class="panel" id="panel">
+
+    <section class="block">
+      <h2>1 · 选图形</h2>
+      <div class="shapes" id="shapes"></div>
+    </section>
+
+    <section class="block">
+      <h2>2 · 尺寸与位置</h2>
+      <label class="row">
+        <span>图形大小</span>
+        <output id="sizeOut">560 m</output>
+      </label>
+      <input type="range" id="size" min="150" max="1600" step="10" value="560">
+
+      <label class="row">
+        <span>离边界最小余量</span>
+        <output id="marginOut">60 m</output>
+      </label>
+      <input type="range" id="margin" min="10" max="300" step="5" value="60">
+      <p class="hint" id="placeHint">余量越大越安全；放不下时会自动微调角度。</p>
+    </section>
+
+    <section class="block">
+      <h2>3 · 跑法</h2>
+      <div class="seg" id="lapsMode">
+        <button type="button" data-v="retrace" class="on">往复（到终点原路返回）</button>
+        <button type="button" data-v="forward">同向绕圈</button>
+      </div>
+      <label class="row"><span>圈数</span><output id="lapsOut">1 圈</output></label>
+      <input type="range" id="laps" min="1" max="6" step="1" value="1">
+
+      <label class="row"><span>配速</span><output id="paceOut">6'00" /km</output></label>
+      <input type="range" id="pace" min="300" max="540" step="5" value="360">
+
+      <label class="check">
+        <input type="checkbox" id="rampOn">
+        <span>配速渐变（手机里轨迹会变成彩色带）</span>
+      </label>
+      <div id="rampBox" class="hidden">
+        <label class="row"><span>起点配速</span><output id="rampAOut">7'30"</output></label>
+        <input type="range" id="rampA" min="300" max="600" step="5" value="450">
+        <label class="row"><span>终点配速</span><output id="rampBOut">4'30"</output></label>
+        <input type="range" id="rampB" min="240" max="540" step="5" value="270">
+      </div>
+    </section>
+
+    <section class="block">
+      <h2>4 · 生成</h2>
+      <label class="row"><span>文件名</span></label>
+      <input type="text" id="outName" class="text" placeholder="留空自动命名">
+      <button class="primary" id="btnGen" type="button">生成 GPX</button>
+      <p class="hint" id="genHint"></p>
+    </section>
+
+    <section class="block">
+      <h2>5 · 定位工具（可选）</h2>
+      <details class="cus">
+        <summary>手动指定经纬度定点</summary>
+        <div class="cusrow">
+          <input id="cusLat" class="text" placeholder="纬度 32.1…">
+          <input id="cusLon" class="text" placeholder="经度 118.9…">
+        </div>
+        <button class="act ghost small" id="btnGoto" type="button">定点到这个坐标</button>
+        <p class="hint">不常跑路线、只想把手机定位钉在某个坐标时用。日常直接从下方「① 注入初始位置」开始。</p>
+      </details>
+    </section>
+
+  </aside>
+
+  <section class="stage">
+    <div class="statline" id="stats">
+      <span class="muted">左侧调参数，这里是实时预览</span>
+    </div>
+    <div class="canvas-wrap" id="canvasWrap">
+      <svg id="map" preserveAspectRatio="xMidYMid meet"></svg>
+      <div class="busy hidden" id="busy">计算中…</div>
+    </div>
+    <div class="legend">
+      <i class="lg-bound"></i>校界
+      <i class="lg-track"></i>轨迹
+      <i class="lg-start"></i>起点
+      <i class="lg-end"></i>终点
+      <span class="grow"></span>
+      <span id="scale"></span>
+    </div>
+  </section>
+</main>
+
+<footer class="dock">
+  <div class="dockrow">
+    <label class="row tight"><span>已生成的路线</span></label>
+    <select id="routeSel"></select>
+    <button id="btnRefresh" class="ghost" type="button" title="刷新列表">刷新</button>
+    <a id="btnDown" class="ghost disabled" href="#">下载 GPX</a>
+  </div>
+
+  <div class="dockrow ctl">
+    <button class="ctlb" id="btnPrime" type="button" title="把手机定位钉到所选路线的起点，并一直保持">
+      <b>①</b>注入初始位置
+    </button>
+    <button class="ctlb run" id="btnPlay" type="button" title="按所选路线把轨迹回放到手机">
+      <b>②</b>开始模拟
+    </button>
+    <button class="ctlb wait" id="btnPause" type="button" disabled title="冻结注入，随时继续，不丢进度">
+      <b>③</b>暂停
+    </button>
+    <button class="ctlb stop" id="btnRelease" type="button" title="停回放 + 释放定点；若手机仍停在旧位置，需拔一次数据线">
+      <b>④</b>结束模拟（恢复定位）
+    </button>
+    <div class="progbox">
+      <div class="prog"><div id="bar"></div></div>
+      <span id="progText">未在回放</span>
+    </div>
+  </div>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
