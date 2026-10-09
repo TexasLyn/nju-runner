@@ -1,6 +1,11 @@
 # 核心依赖：落点搜索用 numpy 加速（纯标准库版本慢 8~25 倍，实时预览扛不住）
 numpy>=1.24
 
-# 真机定位注入才需要，纯画图/生成 GPX 可以不装：
+# 可选但推荐：进程树 / 挂起恢复 / 结束进程三平台统一走 psutil。
+# 不装也能跑 —— core.py 会退化到系统命令（POSIX 用 pgrep/SIGSTOP，
+# Windows 用 wmic/PowerShell + ntdll）。
+# psutil>=5.9
+
+# 真机定位注入才需要，纯画图 / 生成 GPX 可以不装：
 #   pip install pymobiledevice3
 # pymobiledevice3>=4.0

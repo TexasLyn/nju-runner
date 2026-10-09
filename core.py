@@ -68,19 +68,231 @@ def _find_pmd():
     找不到时返回裸名字交给 PATH 解析——缺它只影响真机注入，
     生成 GPX 的整条链路依然可用。
     """
-    env = os.environ.get("PYMOBILEDEVICE3")
-    if env and os.path.isfile(env):
-        return env
-    found = shutil.which("pymobiledevice3")
-    if found:
-        return found
-    cand = os.path.join(HOME, ".workbuddy/binaries/python/envs/default/bin/pymobiledevice3")
-    if os.path.isfile(cand):
-        return cand
+    for var in ("PMD", "PYMOBILEDEVICE3"):
+        p = os.environ.get(var)
+        if p and os.path.isfile(p):
+            return p
+    for name in ("pymobiledevice3", "pymobiledevice3.exe"):
+        found = shutil.which(name)
+        if found:
+            return found
+    for cand in (os.path.join(HOME, ".local/bin/pymobiledevice3"),
+                 os.path.join(os.path.dirname(sys.executable), "pymobiledevice3"),
+                 os.path.join(os.path.dirname(sys.executable), "pymobiledevice3.exe")):
+        if os.path.isfile(cand):
+            return cand
     return "pymobiledevice3"
 
 
 PMD = _find_pmd()
+
+
+# ---------------------------------------------------------------- 平台适配
+#
+# 这个项目原本是照着 macOS 写的：用 `pgrep` 找子进程、用 `SIGSTOP`/`SIGCONT`
+# 做暂停。Windows 上这两样都没有 —— `pgrep` 是 Unix 命令，`signal.SIGSTOP`
+# 在 Windows 上连属性都不存在，被 except 吞掉后会变成「暂停按钮显示成功、
+# 进度照跑」的假成功，比直接报错还糟。所以统一收口到这几个函数。
+#
+# 优先级：psutil（三平台都有，语义最干净）→ 系统原生命令。
+
+IS_WIN = os.name == "nt"
+PY_EXE = sys.executable or ("python" if IS_WIN else "python3")
+
+try:
+    import psutil as _psutil
+except Exception:                       # 没装也能跑，只是退化到系统命令
+    _psutil = None
+
+
+def _detached_kwargs():
+    """后台起进程的参数。
+
+    `start_new_session=True` 在 Windows 上会被**静默忽略**，得改用
+    DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP。注入进程必须脱离本进程，
+    否则服务一退出就把它连坐带走。
+    """
+    if IS_WIN:
+        return {"creationflags": 0x00000008 | 0x00000200}
+    return {"start_new_session": True}
+
+
+def _script_cmd(path, *args):
+    """拼出执行 vendor 脚本的命令行。
+
+    这些脚本没有扩展名，Windows 的 CreateProcess 直接执行会 WinError 193，
+    所以统一交给当前解释器。POSIX 下也走同一条路，少一个平台分支。
+    """
+    return [PY_EXE, path] + [str(a) for a in args]
+
+
+def _pmd_cmd(*args):
+    """拼出执行 pymobiledevice3 的命令行（同上的扩展名问题）。"""
+    ext = os.path.splitext(PMD)[1].lower()
+    if ext == ".py" or (IS_WIN and not ext):
+        return [PY_EXE, PMD] + [str(a) for a in args]
+    return [PMD] + [str(a) for a in args]
+
+
+def _nt_process_call(func_name, pid):
+    """Windows 挂起/恢复进程。
+
+    kernel32 只有 TerminateProcess；挂起得调 ntdll 的 NtSuspendProcess /
+    NtResumeProcess，句柄需要 PROCESS_SUSPEND_RESUME(0x0800) 权限。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        h = k32.OpenProcess(0x0800, False, int(pid))
+        if not h:
+            return False
+        try:
+            fn = getattr(ctypes.WinDLL("ntdll"), func_name)
+            fn.argtypes = [wintypes.HANDLE]
+            fn.restype = ctypes.c_long
+            return fn(h) == 0            # NTSTATUS 0 = STATUS_SUCCESS
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return False
+
+
+def _child_pids(pid):
+    """列出某个进程的所有子进程。"""
+    if _psutil is not None:
+        try:
+            return [c.pid for c in _psutil.Process(pid).children(recursive=True)]
+        except Exception:
+            return []
+    if not IS_WIN:
+        try:
+            out = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True,
+                                 text=True, timeout=5).stdout
+            return [int(x) for x in out.split()]
+        except Exception:
+            return []
+    # Windows 无 psutil：wmic（Win10 常见）→ PowerShell CIM（Win11 24H2 起 wmic 被移除）
+    try:
+        out = subprocess.run(
+            ["wmic", "process", "where", "ParentProcessId=%d" % pid,
+             "get", "ProcessId", "/value"],
+            capture_output=True, text=True, timeout=10).stdout
+        pids = [int(m.group(1)) for m in re.finditer(r"ProcessId=(\d+)", out)]
+        if pids:
+            return pids
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Get-CimInstance Win32_Process -Filter "
+             '"ParentProcessId=%d" | Select-Object -ExpandProperty ProcessId' % pid],
+            capture_output=True, text=True, timeout=20).stdout
+        return [int(x) for x in out.split()]
+    except Exception:
+        return []
+
+
+def _suspend(pid):
+    """冻结进程（连它的 sleep 计时一起冻）。"""
+    if _psutil is not None:
+        try:
+            _psutil.Process(int(pid)).suspend()
+            return True
+        except Exception:
+            return False
+    if IS_WIN:
+        return _nt_process_call("NtSuspendProcess", pid)
+    try:
+        os.kill(int(pid), signal.SIGSTOP)
+        return True
+    except Exception:
+        return False
+
+
+def _resume(pid):
+    """解冻进程。"""
+    if _psutil is not None:
+        try:
+            _psutil.Process(int(pid)).resume()
+            return True
+        except Exception:
+            return False
+    if IS_WIN:
+        return _nt_process_call("NtResumeProcess", pid)
+    try:
+        os.kill(int(pid), signal.SIGCONT)
+        return True
+    except Exception:
+        return False
+
+
+def _terminate(pid, force=False):
+    """结束进程。force=True 时连子进程一起。"""
+    if _psutil is not None:
+        try:
+            p = _psutil.Process(int(pid))
+            if force:
+                for c in p.children(recursive=True):
+                    try:
+                        c.kill()
+                    except Exception:
+                        pass
+            (p.kill if force else p.terminate)()
+            return True
+        except Exception:
+            return False
+    if not IS_WIN:
+        try:
+            os.kill(int(pid), signal.SIGKILL if force else signal.SIGTERM)
+            return True
+        except Exception:
+            return False
+    try:
+        cmd = ["taskkill", "/PID", str(int(pid)), "/F"] + (["/T"] if force else [])
+        subprocess.run(cmd, capture_output=True, timeout=15)
+        return True
+    except Exception:
+        return False
+
+
+def _scan_simulate_play():
+    """扫描系统里所有 `simulate-location play` 进程，返回 [(pid, gpx 路径), ...]。"""
+    hits = []
+    if _psutil is not None:
+        for p in _psutil.process_iter(["pid", "cmdline"]):
+            try:
+                cl = p.info.get("cmdline") or []
+            except Exception:
+                continue
+            if len(cl) < 2:
+                continue
+            s = " ".join(cl)
+            if "simulate-location" not in s or " play" not in s:
+                continue
+            gpxs = [a for a in cl if a.lower().endswith(".gpx")]
+            if gpxs:
+                hits.append((int(p.info["pid"]), gpxs[-1]))
+        return hits
+    if IS_WIN:
+        return []                        # 无 psutil 时不做外部会话探测，避免拖慢
+    try:
+        res = subprocess.run(["pgrep", "-fl", "simulate-location play"],
+                             capture_output=True, text=True, timeout=5)
+    except Exception:
+        return []
+    for line in (res.stdout or "").splitlines():
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        m = re.search(r"simulate-location play\s+(.+?)\s*$", parts[1])
+        if m:
+            hits.append((int(parts[0]), m.group(1).strip()))
+    return hits
 
 
 # ---------------------------------------------------------------- 加载原脚本
@@ -391,9 +603,9 @@ def generate(shape, boundary_file, out_name=None, size=None, pace="6:00",
 
     tmp = os.path.join(OUT_DIR, ".geom-%d.gpx" % os.getpid())
     gpxart.write_geom_gpx(pts_ll, tmp)
-    cmd = [RUNROUTE_PATH, "make", "--from-gpx", tmp, "--pace", str(pace),
+    cmd = _script_cmd(RUNROUTE_PATH, "make", "--from-gpx", tmp, "--pace", str(pace),
            "--laps", str(laps), "--laps-mode", laps_mode,
-           "--seed", str(seed), "-o", out_path]
+           "--seed", str(seed), "-o", out_path)
     if pace_ramp:
         cmd += ["--pace-ramp", pace_ramp]
     if jitter is not None:
@@ -445,7 +657,7 @@ _state = {
 
 def device_info():
     try:
-        res = subprocess.run([PMD, "usbmux", "list"], capture_output=True,
+        res = subprocess.run(_pmd_cmd("usbmux", "list"), capture_output=True,
                              text=True, timeout=15)
         data = json.loads(res.stdout or "[]")
     except Exception as e:
@@ -511,10 +723,10 @@ def play_status():
 def _spawn_set(lat, lon):
     """起一个 simulate-location set 常驻进程（前台阻塞型）。返回 Popen。"""
     return subprocess.Popen(
-        [PMD, "developer", "dvt", "simulate-location", "set",
-         "%.7f" % lat, "%.7f" % lon],
+        _pmd_cmd("developer", "dvt", "simulate-location", "set",
+                 "%.7f" % lat, "%.7f" % lon),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        start_new_session=True)
+        **_detached_kwargs())
 
 
 def gpx_first_point(gpx_path):
@@ -584,12 +796,7 @@ def _injector_pids():
     proc = _state["proc"]
     if proc is None:
         return []
-    try:
-        out = subprocess.run(["pgrep", "-P", str(proc.pid)],
-                             capture_output=True, text=True, timeout=5).stdout
-        return [int(x) for x in out.split()]
-    except Exception:
-        return []
+    return _child_pids(proc.pid)
 
 
 def pause_play():
@@ -607,11 +814,8 @@ def pause_play():
     pids = _injector_pids() or [proc.pid]
     n = 0
     for pid in pids:
-        try:
-            os.kill(pid, signal.SIGSTOP)
+        if _suspend(pid):
             n += 1
-        except Exception:
-            pass
     _state["paused"] = True
     _state["paused_at"] = time.time()
     _state["frozen"] = pids
@@ -629,11 +833,8 @@ def resume_play():
     pids = _state.get("frozen") or _injector_pids() or [proc.pid]
     n = 0
     for pid in pids:
-        try:
-            os.kill(pid, signal.SIGCONT)
+        if _resume(pid):
             n += 1
-        except Exception:
-            pass
     if _state.get("paused_at"):
         _state["paused_total"] = _state.get("paused_total", 0.0) + \
             (time.time() - _state["paused_at"])
@@ -673,9 +874,9 @@ def start_play(gpx_path, prime=True, prime_wait=1.2):
 
     open(PLAY_LOG, "w").close()
     logf = open(PLAY_LOG, "ab")
-    proc = subprocess.Popen([RUNROUTE_PATH, "play", gpx_path],
+    proc = subprocess.Popen(_script_cmd(RUNROUTE_PATH, "play", gpx_path),
                             stdout=logf, stderr=subprocess.STDOUT,
-                            cwd=HERE, start_new_session=True)
+                            cwd=HERE, **_detached_kwargs())
     _state.update(proc=proc, gpx=gpx_path, started=time.time(),
                   duration=st.get("duration"), total_points=st.get("points"))
     return {"pid": proc.pid, "primed": primed,
@@ -712,32 +913,17 @@ def release_all(clear=True):
 
 
 def _resume_if_frozen(proc):
-    """杀进程前先 SIGCONT —— 被 SIGSTOP 的进程收不到 SIGTERM。"""
+    """杀进程前先解冻 —— 被冻结的进程收不到终止信号。"""
     for pid in (_state.get("frozen") or []):
-        try:
-            os.kill(pid, signal.SIGCONT)
-        except Exception:
-            pass
+        _resume(pid)
     _state["paused"] = False
     _state["frozen"] = []
 
 
 def external_play():
     """检测命令行另起的 play 会话（不归本服务管，只做提示）。"""
-    try:
-        res = subprocess.run(["pgrep", "-fl", "simulate-location play"],
-                             capture_output=True, text=True, timeout=5)
-    except Exception:
-        return None
     mine = _state["gpx"]
-    for line in (res.stdout or "").splitlines():
-        parts = line.split(None, 1)
-        if len(parts) < 2:
-            continue
-        m = re.search(r"simulate-location play\s+(.+?)\s*$", parts[1])
-        if not m:
-            continue
-        p = m.group(1).strip()
+    for pid, p in _scan_simulate_play():
         if not os.path.exists(p):
             continue
         if mine and os.path.abspath(p) == os.path.abspath(mine):
@@ -746,7 +932,7 @@ def external_play():
             dur = runroute.gpx_stats(p).get("duration")
         except Exception:
             dur = None
-        return {"pid": int(parts[0]), "file": os.path.basename(p),
+        return {"pid": pid, "file": os.path.basename(p),
                 "duration_hms": runroute.fmt_hms(dur) if dur else None}
     return None
 
@@ -767,16 +953,9 @@ def stop_play(clear=True):
     msgs = []
     if proc.poll() is None:
         _resume_if_frozen(proc)          # 冻结中的进程要先解冻才杀得动
-        try:
-            kids = subprocess.run(["pgrep", "-P", str(proc.pid)],
-                                  capture_output=True, text=True, timeout=5).stdout.split()
-        except Exception:
-            kids = []
+        kids = _child_pids(proc.pid)
         for k in kids:
-            try:
-                os.kill(int(k), signal.SIGTERM)
-            except Exception:
-                pass
+            _terminate(k)
         if not kids:
             try:
                 proc.terminate()
@@ -800,7 +979,7 @@ def stop_play(clear=True):
 
 def clear_location():
     try:
-        subprocess.run([PMD, "developer", "dvt", "simulate-location", "clear"],
+        subprocess.run(_pmd_cmd("developer", "dvt", "simulate-location", "clear"),
                        capture_output=True, timeout=15)
     except Exception:
         pass

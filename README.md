@@ -17,7 +17,11 @@
 ```shell
 git clone <this-repo> && cd nju-runner
 python3 -m pip install -r requirements.txt
+```
 
+**macOS / Linux**
+
+```shell
 ./start.sh              # 默认 http://127.0.0.1:8788
 ./start.sh 9000         # 换端口
 ```
@@ -27,12 +31,57 @@ python3 -m pip install -r requirements.txt
 `start.sh` 会自己找一个装着 numpy 的 Python；要用指定的解释器就
 `NJURUNNER_PY=/path/to/python ./start.sh`。
 
+**Windows**
+
+```bat
+start.bat               :: 默认 8788，自动开浏览器
+start.bat 9000          :: 换端口
+```
+
+`start.bat` 会依次试 `py -3` / `python` / `python3`，挑第一个装了 numpy 的。
+装依赖：
+
+```bat
+pip install numpy
+pip install pymobiledevice3   :: 只有要推真机才需要
+```
+
+装完先自检一遍（不碰手机、不碰定位）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\windows-selftest.ps1
+```
+
+### 平台支持
+
+| 能力 | macOS / Linux | Windows |
+|---|---|---|
+| 画图 / 预览 / 生成 GPX / 下载 | ✅ | ✅ |
+| 越界校验、配速斜坡、多圈往复 | ✅ | ✅ |
+| 真机注入（注入初始位置 / 开始模拟 / 暂停继续 / 结束模拟） | ✅ | ⚠️ 代码已适配，实机验证待补 |
+| Windows 真机注入的额外前提 | — | Apple 移动设备驱动（iTunes / Apple 设备） |
+
+Windows 上的差异点都已收口到 `core.py` 顶部那一小段平台层：
+
+- **暂停 / 继续**：POSIX 用 `SIGSTOP` / `SIGCONT`；Windows 没有这两个信号
+  （`signal.SIGSTOP` 属性都不存在，被 `except` 吞掉后会变成「按钮显示成功、进度照跑」的
+  假成功），改走 `ntdll` 的 `NtSuspendProcess` / `NtResumeProcess`。
+- **找子进程**：POSIX 用 `pgrep -P`；Windows 用 `wmic` → `PowerShell CIM` 逐级回退。
+- **结束进程**：POSIX 发信号；Windows 用 `taskkill`。
+- **后台起进程**：POSIX 用 `start_new_session`；Windows 用
+  `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`（前者在 Windows 上会被静默忽略）。
+- **执行 `vendor/` 里的脚本**：这些文件没有扩展名，Windows 的 `CreateProcess`
+  直接执行会报 `WinError 193`，统一改成用当前解释器起。
+
+装了 `psutil` 的话以上全部优先走 psutil（三平台语义一致），没装就走系统命令，都能用。
+
 ### 跑起来需要什么
 
 | 依赖 | 说明 |
 |---|---|
 | Python 3.9+ | 起服务、算几何 |
 | numpy | 落点搜索加速（`pip install -r requirements.txt`） |
+| **psutil** | **可选但推荐**：进程树、挂起/恢复、结束进程三平台统一走它 |
 | **pymobiledevice3** | **可选**：只有把轨迹推到真机才需要。没有它照样能画图、生成 GPX、下载 |
 | iPhone / iPad | iOS 17+、**已开开发者模式**、数据线直连、解锁并信任本机 |
 
@@ -76,7 +125,7 @@ python3 -m pip install -r requirements.txt
 |---|---|---|
 | **① 注入初始位置** | 把手机定位钉到所选路线的起点，并一直保持 | 位置会停在起点不动，直到你点 ④ |
 | **② 开始模拟** | 按轨迹把点依次推给手机 | 会自动先做一次 ①，衔接无跳变 |
-| **③ 暂停 / 继续** | 冻结 / 解冻注入进程（`SIGSTOP` / `SIGCONT`） | 连计时一起冻住，**不丢进度**；再点变「继续」 |
+| **③ 暂停 / 继续** | 冻结 / 解冻注入进程（`SIGSTOP`↔`SIGCONT`，Windows 走 `NtSuspendProcess`） | 连计时一起冻住，**不丢进度**；再点变「继续」 |
 | **④ 结束模拟（恢复定位）** | 停回放 + 释放定点 + 发 `clear` | 若手机仍停在旧位置，**拔一次数据线** |
 
 右侧进度条实时显示已推送到第几个点、已跑时长 / 预计时长。
@@ -133,14 +182,19 @@ python3 -m pip install -r requirements.txt
 
 ```
 nju-runner/
-├── 启动.command        双击启动（终端）
-├── start.sh            命令行启动（自动找带 numpy 的 Python）
+├── 启动.command        双击启动（macOS）
+├── start.sh            命令行启动（macOS / Linux，自动找带 numpy 的 Python）
+├── start.bat           双击启动（Windows）
 ├── server.py           本地 HTTP 服务 + REST API（纯标准库）
-├── core.py             核心：加载 vendor 工具、numpy 落点搜索、设备与回放控制
+├── core.py             核心：加载 vendor 工具、numpy 落点搜索、平台层、设备与回放控制
 ├── static/             前端单页（无 CDN 依赖，离线可用）
 │   ├── index.html · app.js · style.css
 ├── vendor/             内置的 gpxart / runroute（上游在 ~/.local/bin）
-├── tools/sync-vendor.sh  从上游同步 vendor/
+├── tools/
+│   ├── sync-vendor.py      从上游同步 vendor/（跨平台，替换失配会报错）
+│   ├── sync-vendor.sh      上面那个的 zsh 壳
+│   ├── selftest.py         跨平台自检（环境 / 几何 / 平台原语 / 服务端到端）
+│   └── windows-selftest.ps1  Windows 一键跑自检
 ├── data/boundaries/    边界 GeoJSON（可自行添加）
 ├── docs/               截图
 └── out/                生成的 GPX 与回放日志（不入库）
@@ -152,9 +206,26 @@ nju-runner/
 为了让仓库自包含，这里内置了一份。加载顺序是
 **环境变量 `GPXART_PATH` / `RUNROUTE_PATH` → `vendor/` → `~/.local/bin/`**。
 
-内置副本相对上游只动了两处：shebang 改成 `#!/usr/bin/env python3`、
-`gpxart` 里改为优先找同目录的 `runroute`。上游更新后用
-`./tools/sync-vendor.sh` 一键同步（脚本是幂等的，可重复跑）。
+内置副本相对上游改了三处：
+
+1. shebang → `#!/usr/bin/env python3`；
+2. `gpxart` 里改成优先找同目录的 `runroute`；
+3. `runroute` 里的 `pymobiledevice3` 路径不再是写死的绝对路径，而是
+   **环境变量 `PMD` / `PYMOBILEDEVICE3` → `PATH` → 常见安装位置**。
+
+第 3 条是必需的：写死路径意味着别人 clone 下来点「开始模拟」会直接报
+「找不到 pymobiledevice3」，而 `clear` 会静默变成空操作。
+
+上游更新后同步：
+
+```shell
+./tools/sync-vendor.sh                            # macOS / Linux
+python tools\sync-vendor.py                       # Windows
+GPXART_SRC=/path/to/bin python tools/sync-vendor.py   # 换上游目录
+```
+
+同步脚本用的是**带断言的字面替换**：上游改了措辞、锚点找不到时会直接报错退出，
+而不是静默产出一份坏的副本。跑完还会横扫一遍，确认没有本机路径泄漏进仓库。
 
 ---
 
@@ -182,11 +253,15 @@ nju-runner/
 回放链路是 `runroute play` → `pymobiledevice3 developer dvt simulate-location play`，
 后者是个「按相邻点时间差 sleep，然后 set」的循环。
 
-暂停 = 对**注入进程**发 `SIGSTOP` 把它冻住 —— 连 sleep 计时一起冻。
-继续 = `SIGCONT` 解冻。所以进度、计时都不丢，也不会在设备侧留下残留
+暂停 = 把**注入进程**冻住 —— 连 sleep 计时一起冻。
+继续 = 解冻。所以进度、计时都不丢，也不会在设备侧留下残留
 （对比之下，直接 kill 就会残留，只能拔线）。
 
-服务退出时会先 `SIGCONT` 再杀，避免留下一个冻结的僵尸进程。
+冻住的办法按平台分：POSIX 是 `SIGSTOP` / `SIGCONT`；Windows 没有这两个信号，
+走 `ntdll.NtSuspendProcess` / `NtResumeProcess`（需要 `PROCESS_SUSPEND_RESUME` 权限的句柄）。
+装了 psutil 则两边都优先用 `psutil.Process.suspend()/resume()`。
+
+服务退出时会先解冻再杀，避免留下一个冻结的僵尸进程。
 
 ---
 

@@ -23,11 +23,54 @@ import argparse
 import math
 import os
 import random
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 
-PMD = "/Users/texas/.workbuddy/binaries/python/envs/default/bin/pymobiledevice3"
+IS_WIN = os.name == "nt"
+PY_EXE = sys.executable or ("python" if IS_WIN else "python3")
+
+
+def _find_pmd():
+    """定位 pymobiledevice3：环境变量 → PATH → 常见安装位置。
+
+    以前这里是写死的绝对路径，导致别人 clone 下来点「开始模拟」直接报
+    「找不到 pymobiledevice3」，`clear` 还会静默变成空操作。
+    """
+    for var in ("PMD", "PYMOBILEDEVICE3"):
+        p = os.environ.get(var)
+        if p and os.path.isfile(p):
+            return p
+    for name in ("pymobiledevice3", "pymobiledevice3.exe"):
+        found = shutil.which(name)
+        if found:
+            return found
+    for cand in (os.path.expanduser("~/.local/bin/pymobiledevice3"),
+                 os.path.join(os.path.dirname(sys.executable), "pymobiledevice3"),
+                 os.path.join(os.path.dirname(sys.executable), "pymobiledevice3.exe")):
+        if os.path.isfile(cand):
+            return cand
+    return "pymobiledevice3"
+
+
+PMD = _find_pmd()
+
+
+def _pmd_available():
+    return bool(shutil.which(PMD))
+
+
+def _pmd_cmd(*args):
+    """拼出可直接交给 subprocess 的命令行。
+
+    PMD 若是 `.py` 脚本、或 Windows 上那种无扩展名的入口脚本，
+    必须用解释器起 —— 直接执行会 WinError 193。
+    """
+    ext = os.path.splitext(PMD)[1].lower()
+    if ext == ".py" or (IS_WIN and not ext):
+        return [PY_EXE, PMD] + list(args)
+    return [PMD] + list(args)
 M_PER_DEG_LAT = 111320.0
 
 
@@ -372,8 +415,9 @@ def cmd_info(args):
 
 
 def cmd_play(args):
-    if not os.path.exists(PMD):
-        sys.exit("找不到 pymobiledevice3: %s" % PMD)
+    if not _pmd_available():
+        sys.exit("找不到 pymobiledevice3: %s\n"
+                 "请 pip install pymobiledevice3，或用环境变量 PMD=<路径> 指定。" % PMD)
     st = gpx_stats(args.file)
     if st.get("timed") is False:
         print("警告: 该 GPX 没有 <time>，回放会瞬间推完（约 0 秒）。", file=sys.stderr)
@@ -381,7 +425,7 @@ def cmd_play(args):
               file=sys.stderr)
     if st.get("duration"):
         print("即将回放 %s（约 %s）。Ctrl+C 停止。" % (args.file, fmt_hms(st["duration"])))
-    cmd = [PMD, "developer", "dvt", "simulate-location", "play", args.file]
+    cmd = _pmd_cmd("developer", "dvt", "simulate-location", "play", args.file)
     if args.randomness:
         cmd.append(str(args.randomness))
         print("注意: 你启用了 --timing-randomness %d ms —— 它会二次扰动配速，"
@@ -407,9 +451,9 @@ HARD_RESET_HINT = (
 
 
 def clear_location():
-    if not os.path.exists(PMD):
+    if not _pmd_available():
         return
-    subprocess.run([PMD, "developer", "dvt", "simulate-location", "clear"],
+    subprocess.run(_pmd_cmd("developer", "dvt", "simulate-location", "clear"),
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 

@@ -36,6 +36,10 @@ def _fn_find_runroute():
 
 RUNROUTE = _fn_find_runroute()
 
+# runroute 是无扩展名的 Python 脚本：Windows 上不能直接执行（WinError 193），
+# 统一用当前解释器起，POSIX 下也一并统一，少一条平台分支。
+PY_EXE = sys.executable or ("python" if os.name == "nt" else "python3")
+
 
 def m_per_deg_lon(lat):
     return M_PER_DEG * math.cos(math.radians(lat))
@@ -491,7 +495,7 @@ def cmd_make(args):
         sys.exit("缺少 -o 输出文件")
     tmp = tempfile.mktemp(suffix=".gpx")
     write_geom_gpx(pts_ll, tmp)
-    cmd = [RUNROUTE, "make", "--from-gpx", tmp, "--pace", args.pace,
+    cmd = [PY_EXE, RUNROUTE, "make", "--from-gpx", tmp, "--pace", args.pace,
            "--laps", str(args.laps), "--laps-mode", args.laps_mode,
            "--seed", str(args.seed), "-o", args.out]
     if args.pace_ramp:
