@@ -360,7 +360,7 @@ GPXART_SRC=/path/to/bin python tools/sync-vendor.py   # 换上游目录
 纯秒数 `360`。归一化在 `core.py` 的 `_norm_pace()` 里做，不去改 `vendor/` ——
 免得 `tools/sync-vendor.py` 重同步时把补丁冲掉。
 
-两个和「摆位」相关的字段：
+几个和「摆位 / 真实度」相关的字段：
 
 - **`points`**（`/api/generate` 专用）：传一串 `[lat,lon]` 点列，就**跳过自动落点搜索、
   直接按你给的点出 GPX** —— 前端手动拖完位置/角度后就是靠它做到「所见即所得」。
