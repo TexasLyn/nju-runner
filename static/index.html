@@ -140,6 +140,13 @@
     <a id="btnDown" class="ghost disabled" href="#">下载 GPX</a>
   </div>
 
+  <div class="targetline">
+    <span class="tk">② 将要跑的路线</span>
+    <b id="targetName">未选择</b>
+    <span class="grow"></span>
+    <span class="tw" id="targetNote"></span>
+  </div>
+
   <div class="dockrow ctl">
     <button class="ctlb" id="btnPrime" type="button" title="把手机定位钉到所选路线的起点，并一直保持">
       <b>①</b>注入初始位置
@@ -147,7 +154,7 @@
     <button class="ctlb run" id="btnPlay" type="button" title="按所选路线把轨迹回放到手机">
       <b>②</b>开始模拟
     </button>
-    <button class="ctlb wait" id="btnPause" type="button" disabled
+    <button class="ctlb wait" id="btnPause" type="button"
             title="冻结轨迹注入，随时继续、不丢进度。注意：手机端的运动 App 不会跟着停，请手动也暂停记录">
       <b>③</b>暂停
     </button>

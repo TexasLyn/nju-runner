@@ -23,6 +23,8 @@ let shapesMeta = {};
 let pollTimer = null;
 let lastData = null;      // 最近一次预览结果，供 resize 重绘
 let playState = { running: false, paused: false, external: null };
+let runningFile = null;   // 服务器上正在跑的文件名（tick 刷新）
+const ROUTE_KEY = "njurunner.route";
 
 const fmtPace = (s) => `${Math.floor(s / 60)}'${String(s % 60).padStart(2, "0")}"`;
 const fmtM = (m) => m >= 1000 ? (m / 1000).toFixed(2) + " km" : Math.round(m) + " m";
@@ -260,18 +262,67 @@ async function doGenerate() {
 }
 
 /* ---------------------------------------------------------------- 路线列表 */
+function selectedRoute() { return $("routeSel").value || ""; }
+
+function storedRoute() {
+  try { return localStorage.getItem(ROUTE_KEY) || ""; } catch (e) { return ""; }
+}
+
+function rememberRoute(f) {
+  try { f ? localStorage.setItem(ROUTE_KEY, f) : localStorage.removeItem(ROUTE_KEY); } catch (e) {}
+}
+
 async function loadRoutes(select) {
   const { routes } = await api("/api/routes");
   const sel = $("routeSel");
+  // 想在重建列表后继续选中原来那条：显式传入 > 当前选中 > 上次记住的
+  const want = select || sel.value || storedRoute() || "";
   sel.innerHTML = "";
+
+  // 占位项：绝不再「静默默认第一条」——那正是「以为选了 A、实际跑了 B」的温床
+  const ph = document.createElement("option");
+  ph.value = "";
+  ph.textContent = "— 请选一条路线 —";
+  sel.appendChild(ph);
+
   routes.forEach(r => {
     const o = document.createElement("option");
     o.value = r.file;
     o.textContent = `${r.file}${r.length_m ? ` · ${(r.length_m / 1000).toFixed(2)}km` : ""}${r.duration_hms ? ` · ${r.duration_hms}` : ""}`;
     sel.appendChild(o);
   });
-  if (select) sel.value = select;
+
+  const hit = routes.some(r => r.file === want) ? want : "";
+  sel.value = hit;
+  rememberRoute(hit);
   syncDown();
+  renderTarget();
+}
+
+/* 「将要跑的路线」：让"选了哪条"和"跑了哪条"不可能对不上 */
+function renderTarget() {
+  const f = selectedRoute();
+  const tn = $("targetName");
+  if (tn) {
+    tn.textContent = f || "未选择（先在上方挑一条）";
+    tn.classList.toggle("muted", !f);
+  }
+  const note = $("targetNote");
+  if (!note) return;
+  const busyFile = runningFile || (playState.external && playState.external.file) || null;
+  if (busyFile && f && f !== busyFile) {
+    note.innerHTML = `⚠ 现在跑的是 <b>${busyFile}</b> —— 先点 <b>④ 结束模拟</b>，才能换成这条`;
+    note.className = "tw warn";
+  } else if (busyFile) {
+    note.innerHTML = `正在跑 <b>${busyFile}</b>`;
+    note.className = "tw";
+  } else if (!f) {
+    note.textContent = "选一条，再点 ②";
+    note.className = "tw";
+  } else {
+    note.textContent = "";
+    note.className = "tw";
+  }
 }
 
 function syncDown() {
@@ -326,36 +377,76 @@ function renderPauseHint() {
   el.classList.toggle("on", on);
 }
 
+/* 锁住按钮但**不用原生 disabled**：原生 disabled 会把点击彻底吞掉（连 alert 都没有），
+   于是「选了新路线 → 点② → 毫无反应 → 手机上还在跑旧的」看起来就像「路线选择失效」。
+   改成 .locked：视觉上变淡，但点下去一定会告诉你为什么不行。 */
+function lockWhy(el, reason, title) {
+  el.disabled = false;              // 兜底：HTML 里若残留 disabled，这里一并抹掉
+  el.classList.toggle("locked", !!reason);
+  el.dataset.lock = reason || "";
+  if (title) el.title = title;
+}
+
+function busyFileNow() {
+  return runningFile || (playState.external && playState.external.file) || "";
+}
+
 function syncButtons() {
   const running = playState.running;
   const paused = playState.paused;
   const ext = playState.external;
   const busy = running || !!ext;                    // 有会话在跑（本页或外部）
   const dev = S.device;
+  const cur = busyFileNow() || "（未知）";
 
-  $("btnPrime").disabled = !dev || busy;
-  $("btnPlay").disabled = !dev || busy;
-  $("btnPause").disabled = !dev || !running || !!ext;   // 只对本页起的回放有效
-  $("btnRelease").disabled = !dev;
+  lockWhy($("btnPrime"), !dev ? "dev" : (busy ? "busy" : ""),
+    !dev ? "没检测到设备：插好数据线、解锁并信任本机"
+         : busy ? `现在正跑着《${cur}》，先点 ④ 结束模拟`
+                : "把手机定位钉到所选路线的起点，并一直保持");
+  lockWhy($("btnPlay"), !dev ? "dev" : (busy ? "busy" : ""),
+    !dev ? "没检测到设备：插好数据线、解锁并信任本机"
+         : busy ? `现在正跑着《${cur}》，先点 ④ 结束模拟`
+                : "按所选路线把轨迹回放到手机");
+  lockWhy($("btnPause"), !dev ? "dev" : (!running ? "idle" : ""),
+    !dev ? "没检测到设备"
+         : !running ? "当前没有在跑的回放"
+                    : paused ? "解冻注入，从断点接着跑。回到手机端把运动 App 也一起恢复"
+                             : "冻结轨迹注入，不丢进度。注意：手机端运动 App 不会跟着停，请手动也暂停记录");
+  lockWhy($("btnRelease"), !dev ? "dev" : "",
+    !dev ? "没检测到设备" : "停回放 + 释放定点；若手机仍停在旧位置，需拔一次数据线");
 
   const pb = $("btnPause");
   if (paused) {
     pb.innerHTML = "<b>③</b>继续";
-    pb.title = "解冻注入，从断点接着跑。回到手机端把运动 App 也一起恢复";
     pb.classList.add("on");
   } else {
     pb.innerHTML = "<b>③</b>暂停";
-    pb.title = "冻结轨迹注入，不丢进度。注意：手机端运动 App 不会跟着停，请手动也暂停记录";
     pb.classList.remove("on");
   }
   renderPauseHint();
+  renderTarget();
+}
+
+/* 起播/注入前的统一检查：任何一条不满足都要**说清楚原因**，绝不静默失败 */
+function preflight(action) {
+  const f = selectedRoute();
+  if (!S.device) return { msg: "没检测到设备。\n\n插好数据线、解锁手机并在弹窗里点「信任」，再试。" };
+  if (playState.running || playState.external) {
+    const cur = busyFileNow() || "（未知）";
+    return { msg: `现在正跑着《${cur}》，不能同时再起一条。\n\n` +
+                  `· 想继续跑它 → 点 ③ 继续\n· 想换路线 → 先点 ④ 结束模拟，再选新路线点 ②\n\n` +
+                  (f && f !== cur ? `（你刚选的《${f}》要等结束后才能跑）` : "") };
+  }
+  if (!f) return { msg: `还没选路线。\n\n先在上方的「已生成的路线」里挑一条，再点 ${action}。` };
+  return { f };
 }
 
 async function doPrime() {
-  const f = $("routeSel").value;
-  if (!f) return alert("先选一条路线");
+  const chk = preflight("① 注入初始位置");
+  if (chk.msg) return alert(chk.msg);
+  const f = chk.f;
   const btn = $("btnPrime");
-  btn.disabled = true;
+  btn.classList.add("locked");
   try {
     const r = await api("/api/prime", { file: f });
     setProg(`已注入初始位置 ${r.lat.toFixed(6)}, ${r.lon.toFixed(6)}（点「开始模拟」继续）`);
@@ -380,13 +471,15 @@ async function doGoto() {
 }
 
 async function doPlay() {
-  const f = $("routeSel").value;
-  if (!f) return alert("先选一条路线");
+  const chk = preflight("② 开始模拟");
+  if (chk.msg) return alert(chk.msg);
+  const f = chk.f;
   if (!confirm(`开始模拟《${f}》？\n\n回放期间别拔线。中途要停就点「暂停」，或点「结束模拟」。`)) return;
   const btn = $("btnPlay");
-  btn.disabled = true;
+  btn.classList.add("locked");
   try {
     const r = await api("/api/play", { file: f });
+    runningFile = f;
     playState = { running: true, paused: false, external: null };
     setProg(`回放中：${f} · 预计 ${r.duration_hms}`, "live");
     startPoll();
@@ -398,8 +491,9 @@ async function doPlay() {
 }
 
 async function doPause() {
+  if (!playState.running) return alert("当前没有在跑的回放，没什么可暂停的。");
   const btn = $("btnPause");
-  btn.disabled = true;
+  btn.classList.add("locked");
   try {
     if (playState.paused) {
       await api("/api/resume", {});
@@ -416,12 +510,14 @@ async function doPause() {
 }
 
 async function doRelease() {
+  if (!S.device) return alert("没检测到设备。插好数据线、解锁手机后再试。");
   if (!confirm("结束模拟并恢复定位？\n\n会停掉回放、释放定点，并向设备发送「停止模拟定位」。\n注意：这条指令没有回执，若手机地图还停在旧位置，需要拔一次数据线。")) return;
   const btn = $("btnRelease");
-  btn.disabled = true;
+  btn.classList.add("locked");
   setProg("正在结束模拟…");
   try {
     const r = await api("/api/release", {});
+    runningFile = null;
     playState = { running: false, paused: false, external: null };
     setProg(r.messages.join(" · "));
     $("bar").style.width = "0%";
@@ -443,6 +539,7 @@ async function tick() {
   try {
     const s = await api("/api/status");
     playState = { running: !!s.running, paused: !!s.paused, external: s.external || null };
+    runningFile = s.running ? s.gpx : null;
     if (s.running) {
       $("bar").style.width = (s.progress * 100).toFixed(1) + "%";
       const pct = (s.progress * 100).toFixed(0);
@@ -499,7 +596,11 @@ function bind() {
   $("btnPause").onclick = doPause;
   $("btnRelease").onclick = doRelease;
   $("btnRefresh").onclick = () => loadRoutes();
-  $("routeSel").onchange = syncDown;
+  $("routeSel").onchange = () => {
+    syncDown();
+    rememberRoute(selectedRoute());
+    renderTarget();
+  };
   $("btnTheme").onclick = toggleTheme;
 }
 
