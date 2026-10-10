@@ -81,6 +81,11 @@
         <output id="marginOut">60 m</output>
       </label>
       <input type="range" id="margin" min="10" max="300" step="5" value="60">
+      <div class="panrow">
+        <button class="act ghost small hidden" id="btnReset" type="button"
+                title="回到程序自动算出的最优位置与角度">重置位置与角度</button>
+        <span class="panhint" id="panHint">拖绿点挪位置，拖外侧圆钮转角度</span>
+      </div>
       <p class="hint" id="placeHint">余量越大越安全；放不下时会自动微调角度。</p>
     </section>
 
@@ -110,6 +115,13 @@
         <label class="row"><span>终点配速</span><output id="rampBOut">4'30"</output></label>
         <input type="range" id="rampB" min="240" max="540" step="5" value="270">
       </div>
+
+      <label class="row"><span>配速波动</span><output id="noiseOut">±8%</output></label>
+      <input type="range" id="noise" min="0" max="30" step="1" value="8">
+      <label class="row"><span>GPS 漂移</span><output id="jitterOut">2.5 m</output></label>
+      <input type="range" id="jitter" min="0" max="10" step="0.5" value="2.5">
+      <p class="hint">真实跑步不会匀速：<b>配速波动</b>让每公里快慢自然起伏（0 = 完全匀速），
+        <b>GPS 漂移</b>是定位本身的抖动幅度。</p>
     </section>
 
     <section class="block" data-title="生成">
@@ -154,12 +166,14 @@
         </svg>
         <span id="mapLabel">真实地图</span>
       </button>
+      <div class="boundwarn hidden" id="boundWarn"></div>
       <div class="tilewarn hidden" id="tileWarn">真实地图取不到瓦片（网络问题），已继续用极简底图</div>
     </div>
     <div class="legend">
       <i class="lg-bound"></i>校界
       <i class="lg-track"></i>轨迹
-      <i class="lg-start"></i>起点
+      <i class="lg-start"></i>起点（可拖）
+      <i class="lg-rot"></i>旋转（可拖）
       <i class="lg-end"></i>终点
       <span class="grow"></span>
       <a class="attrib hidden" id="osmAttrib" href="https://www.openstreetmap.org/copyright"
@@ -207,10 +221,10 @@
   <p class="dockhint" id="pauseHint"></p>
 
   <div class="dockfoot">
-    <span class="credit">思路来自同学的项目
+    <span class="credit">感谢 macanine 的
       <a href="https://github.com/macanine/zhangxuefeng" target="_blank" rel="noopener noreferrer"
          title="macanine / zhangxuefeng —— Python + Flask + Leaflet 的校园轨迹画板">zhangxuefeng</a>
-      · 谢了兄弟</span>
+      对本项目的启发！</span>
   </div>
 </footer>
 

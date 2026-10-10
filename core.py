@@ -701,6 +701,77 @@ def preview_track(track_file, direction="ccw"):
 
 
 
+# ---------------------------------------------------------------- 余量与越界分级
+
+# 越界深度 ≤ 1 km 算黄色警告，超过 1 km 算红色警告（前端按 level 上色）
+BOUND_WARN_M = 1000.0
+
+
+def margin_level(margin_m):
+    """把「离边界最小余量」分成三级。
+
+    margin_m 正数 = 界内还剩多少米；负数 = 越界多少米。
+    越界 1 km 以内 → "warn"（黄）；超过 1 km → "danger"（红）。
+    """
+    over = -float(margin_m)
+    if over <= 0:
+        return "ok"
+    return "warn" if over <= BOUND_WARN_M else "danger"
+
+
+def margin_note(margin_m, margin=60.0):
+    """给 UI 的一句话说明。前端只按 level 决定配色，文案由这里统一给。"""
+    level = margin_level(margin_m)
+    over = -float(margin_m)
+    if level == "ok":
+        if margin_m < margin * 0.9:
+            return "余量只有 %.0f m（目标 %.0f m），已尽量贴边放置" % (margin_m, margin)
+        return None
+    if level == "warn":
+        return ("图形越过校界约 %.0f m —— 校界只是个参考，照样能生成；"
+                "想完全落在校内，把「图形大小」调小" % over)
+    return ("图形越过校界约 %.1f km —— 离校区已经很远，"
+            "手机上的轨迹会明显跑到校外" % (over / 1000.0))
+
+
+def _margin_fields(margin_m, margin=60.0):
+    return {
+        "margin_m": float(margin_m),
+        "over_m": max(0.0, -float(margin_m)),
+        "level": margin_level(margin_m),
+        "ok": float(margin_m) > 0,
+        "note": margin_note(margin_m, margin),
+    }
+
+
+def eval_points(points, boundary_file, margin=60.0):
+    """给一串 [lat,lon] 点列，算它相对校界的余量。**不落盘、不调 runroute。**
+
+    前端拖完轨迹后复核用：拖动是浏览器里本地平移的，而精确余量
+    （点到边界的最短距离）得交给 numpy 算，所以松手后回这一趟。
+    """
+    boundary_path = boundary_file if os.path.isabs(boundary_file) \
+        else os.path.join(BOUND_DIR, boundary_file)
+    ring, frame, poly = load_boundary(boundary_path)
+    Q, A, B, D, L2s = _poly_arrays(poly)
+
+    pts = [(float(p[0]), float(p[1])) for p in points]      # [lat,lon]
+    P = np.asarray([frame.fwd(lo, la) for la, lo in pts], dtype=float)
+    d = _dist_batch(P, A, B, D, L2s)
+    margin_m = float(d.min()) if len(d) else 0.0
+    lats = [p[0] for p in pts]
+    lons = [p[1] for p in pts]
+
+    out = {
+        "points": len(pts),
+        "out_of_bounds": int((d < 0).sum()) if len(d) else 0,
+        "center": [sum(lats) / len(lats), sum(lons) / len(lons)],
+        "boundary": [[p[1], p[0]] for p in ring],
+    }
+    out.update(_margin_fields(margin_m, margin))
+    return out
+
+
 # ---------------------------------------------------------------- 预览（纯几何，不补时间）
 
 def preview(shape, boundary_file, size=None, margin=60.0, seed_ignore=None,
@@ -732,13 +803,12 @@ def preview(shape, boundary_file, size=None, margin=60.0, seed_ignore=None,
 
     length = gpxart.path_len(placed)
     area = abs(gpxart.shoelace(poly)) / 1e6
-    return {
+    out = {
         "kind": "shape",
         "shape": shape, "shape_name": cn,
         "size": size, "rotation": rot,
         "center": [clat, clon],
         "length_m": length,
-        "margin_m": margin_m,
         "closed": closed,
         "area_km2": area,
         # view = 取景框（图形版就是校界本身）；前端统一按 view 投影
@@ -746,8 +816,9 @@ def preview(shape, boundary_file, size=None, margin=60.0, seed_ignore=None,
         "boundary": [[p[1], p[0]] for p in ring],       # [lat,lon]
         "campus_boundary": None,
         "track": [[p[1], p[0]] for p in pts_ll],        # [lat,lon]
-        "ok": margin_m > 0,
     }
+    out.update(_margin_fields(margin_m, margin))
+    return out
 
 
 # ---------------------------------------------------------------- 越界校验（沿线段加密）
@@ -803,36 +874,43 @@ def _norm_pace_ramp(text):
 
 def generate(shape, boundary_file, out_name=None, size=None, pace="6:00",
              laps=1, laps_mode="retrace", pace_ramp=None, seed=42,
-             margin=60.0, avoid=None, jitter=None, pace_noise=None, allow_out=True):
+             margin=60.0, avoid=None, jitter=None, pace_noise=None, allow_out=True,
+             points=None):
     """生成图形 GPX。
 
     allow_out=True（默认）：**越界不再拒绝**。以前余量为负会直接报错，
     但校界只是个参考 —— 有人国庆回老家照样跑，那边根本没有「南大边界」。
     现在越界照生成，只回一条 warning 让用户知道。
+
+    points 给了（前端把拖动摆位后的点列发过来）就**跳过自动落点搜索**，
+    直接按这点列出 GPX —— 所见即所得，屏幕上是哪就是哪。
     """
     boundary_path = boundary_file if os.path.isabs(boundary_file) \
         else os.path.join(BOUND_DIR, boundary_file)
     ring, frame, poly = load_boundary(boundary_path)
 
-    fn, default_size, cn = gpxart.SHAPES[shape]
-    size = float(size or default_size)
-    shape_pts = gpxart.normalize(fn(), size)
-    margin_m, rot, cx, cy, placed = place_shape(
-        poly, shape_pts, shape, need=max(margin, 0.0), avoid=avoid)
+    fn, default_size, cn = gpxart.SHAPES.get(shape, (None, 0.0, shape))
 
-    warning = None
-    if margin_m <= 0:
-        if not allow_out:
-            raise ValueError("图形越界了（余量 %.0f m），把尺寸调小" % margin_m)
-        warning = ("图形超出校界 %.0f m —— 仍按最优位置生成。"
-                   "要完全落在校内，请把「图形大小」调小" % abs(margin_m))
-    elif margin_m < margin * 0.9:
-        warning = "余量只有 %.0f m（目标 %.0f m），已尽量贴边放置" % (margin_m, margin)
+    if points:
+        # 手动摆位：点列由前端给，格式 [lat,lon]，与原 track 一致
+        pts_ll = [(float(p[1]), float(p[0])) for p in points]       # (lon,lat)
+        placed = [frame.fwd(lo, la) for lo, la in pts_ll]
+        Q, A, B, D, L2s = _poly_arrays(poly)
+        margin_m = float(_dist_batch(np.asarray(placed, dtype=float), A, B, D, L2s).min())
+        rot = 0
+    else:
+        size = float(size or default_size)
+        shape_pts = gpxart.normalize(fn(), size)
+        margin_m, rot, cx, cy, placed = place_shape(
+            poly, shape_pts, shape, need=max(margin, 0.0), avoid=avoid)
+        pts_ll = [frame.inv(x, y) for (x, y) in placed]
+        gap = math.hypot(placed[-1][0] - placed[0][0], placed[-1][1] - placed[0][1])
+        if gap < 25.0:      # 天然闭合才收尾（字母/螺旋强行闭合会多一条横贯直线）
+            pts_ll = pts_ll + [pts_ll[0]]
 
-    pts_ll = [frame.inv(x, y) for (x, y) in placed]
-    gap = math.hypot(placed[-1][0] - placed[0][0], placed[-1][1] - placed[0][1])
-    if gap < 25.0:
-        pts_ll = pts_ll + [pts_ll[0]]
+    if not allow_out and margin_m <= 0:
+        raise ValueError("图形越界了（余量 %.0f m），把尺寸调小" % margin_m)
+    warning = margin_note(margin_m, margin)
 
     out_name = out_name or "%s-%s.gpx" % (shape, time.strftime("%m%d-%H%M%S"))
     if not out_name.endswith(".gpx"):
@@ -862,7 +940,7 @@ def generate(shape, boundary_file, out_name=None, size=None, pace="6:00",
 
     st = runroute.gpx_stats(out_path)
     chk = check_bounds(out_path, boundary_path, margin=margin)
-    return {
+    out = {
         "file": os.path.basename(out_path),
         "path": out_path,
         "kind": "shape",
@@ -872,11 +950,13 @@ def generate(shape, boundary_file, out_name=None, size=None, pace="6:00",
         "points": st.get("points"),
         "pace": pace, "laps": laps, "laps_mode": laps_mode,
         "pace_ramp": pace_ramp,
-        "margin_m": margin_m, "rotation": rot,
+        "rotation": rot,
         "warning": warning,
         "check": chk,
         "raw": (res.stdout or "").strip().splitlines(),
     }
+    out.update(_margin_fields(margin_m, margin))
+    return out
 
 
 # ---------------------------------------------------------------- 生成 GPX（操场跑道）

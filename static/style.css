@@ -190,7 +190,8 @@ button.primary:disabled{opacity:.55; cursor:default}
 .statline{display:flex; gap:18px; flex-wrap:wrap; align-items:baseline; margin-bottom:12px; font-size:13px; min-height:26px; flex:0 0 auto}
 .statline b{font-size:19px; font-weight:650; font-variant-numeric:tabular-nums}
 .statline .k{color:var(--ink3); font-size:11.5px; margin-right:5px}
-.statline .warn{color:var(--end); font-weight:600}
+.statline .warn{color:var(--wait); font-weight:600}
+.statline .danger{color:var(--end); font-weight:600}
 .statline .good{color:var(--start); font-weight:600}
 
 .canvas-wrap{
@@ -238,6 +239,38 @@ button.primary:disabled{opacity:.55; cursor:default}
   font-size:11.5px; line-height:1.4; padding:6px 11px; border-radius:8px;
   background:rgba(224,70,75,.93); color:#fff; box-shadow:0 2px 10px rgba(0,0,0,.25);
 }
+
+/* 越界警示条：越界 ≤1 km 黄、>1 km 红。画布恒深色，所以用固定色 + 白字。
+   位置放在左上角、让开 .maptoggle（那是 12px/12px 一颗药丸，约 150px 宽）。 */
+.boundwarn{
+  position:absolute; left:12px; top:12px; z-index:4; max-width:calc(100% - 200px);
+  font-size:11.5px; line-height:1.45; padding:6px 11px; border-radius:8px;
+  color:#fff; box-shadow:0 2px 10px rgba(0,0,0,.25); pointer-events:none;
+}
+.boundwarn.warn{background:rgba(198,133,12,.95); margin-top:42px}
+.boundwarn.danger{background:rgba(198,40,46,.95); margin-top:42px}
+
+/* 越界等级的文字色（面板里用，跟 stats 一套） */
+.lv-warn{color:var(--wait); font-weight:600}
+.lv-danger{color:var(--end); font-weight:600}
+
+/* ---------------------------------------------------------------- 拖拽摆位 */
+/* 平移：套在起点绿点外的虚线环。旋转：图形外侧一根虚线臂 + 一个蓝色圆钮。 */
+#map .grab, #map .rot{cursor:grab; touch-action:none}
+#map.dragging{cursor:grabbing}
+#map .grab-hit, #map .rot-hit{fill:rgba(37,192,107,.001); pointer-events:all}
+#map .rot-hit{fill:rgba(79,143,232,.001)}
+#map .grab-ring{fill:none; stroke-dasharray:3 3; opacity:.85}
+#map .rot-knob{fill:#4f8fe8}
+#map .rot-glyph, #map .rot-arm{pointer-events:none}
+#map.dragging .grab-ring, #map.dragging .rot-arm{stroke-dasharray:none; opacity:1}
+/* 拖动时给轨迹一点「拿起来了」的暗示 */
+#map.dragging .overlay polyline{filter:drop-shadow(0 3px 6px rgba(0,0,0,.45))}
+
+.panrow{display:flex; align-items:center; gap:10px; margin-top:10px; flex-wrap:wrap}
+.panrow .act{flex:0 0 auto}
+.panhint{font-size:11.5px; color:var(--ink3); line-height:1.5}
+.panhint b{color:var(--brand-d); font-weight:600}
 .busy{
   position:absolute; top:12px; right:14px; font-size:12px; color:#c7d4e6;
   background:rgba(255,255,255,.10); padding:4px 10px; border-radius:99px;
@@ -247,6 +280,7 @@ button.primary:disabled{opacity:.55; cursor:default}
 .lg-bound{background:#5f9ce0} .lg-track{background:var(--track); height:3.5px}
 .lg-start{width:9px !important; height:9px !important; border-radius:50% !important; background:var(--start)}
 .lg-end{width:9px !important; height:9px !important; border-radius:50% !important; background:var(--end)}
+.lg-rot{width:10px !important; height:10px !important; border-radius:50% !important; background:#4f8fe8}
 /* OSM 署名：用了人家的瓦片就得标出来（使用条款要求） */
 .legend .attrib{
   font-size:10.5px; color:var(--ink3); text-decoration:none;

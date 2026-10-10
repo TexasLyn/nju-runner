@@ -174,6 +174,8 @@ def api_generate(p):
             direction=p.get("direction", "ccw"),
             pace_ramp=p.get("pace_ramp") or None,
             seed=int(p.get("seed", 42)),
+            jitter=p.get("jitter"),
+            pace_noise=p.get("pace_noise"),
         )
     return core.generate(
         shape=p.get("shape", "heart"),
@@ -186,7 +188,20 @@ def api_generate(p):
         pace_ramp=p.get("pace_ramp") or None,
         seed=int(p.get("seed", 42)),
         margin=float(p.get("margin", 60.0)),
+        jitter=p.get("jitter"),
+        pace_noise=p.get("pace_noise"),
+        # 前端拖动摆位后把点列带过来 → 后端跳过自动落点，照这点列出 GPX
+        points=p.get("points") or None,
     )
+
+
+def api_eval(p):
+    """给一串点列算余量（前端拖完轨迹后复核用）。不落盘。"""
+    pts = p.get("points") or []
+    if not pts:
+        return {"error": "没有点列"}
+    return core.eval_points(pts, p.get("boundary", "boundary-nju-xianlin.geojson"),
+                            margin=float(p.get("margin", 60.0)))
 
 
 def api_check(p):
@@ -278,6 +293,7 @@ GET_ROUTES = {
 POST_ROUTES = {
     "/api/preview": api_preview,
     "/api/generate": api_generate,
+    "/api/eval": api_eval,
     "/api/check": api_check,
     "/api/play": api_play,
     "/api/pause": api_pause,

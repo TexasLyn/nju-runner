@@ -21,6 +21,10 @@ const S = {
   rampOn: false,
   rampA: 450,
   rampB: 270,
+  noise: 8,             // 配速波动 ±%（真实跑步不会匀速）
+  jitter: 2.5,          // GPS 漂移 米
+  pan: [0, 0],          // 手动摆位：相对自动落点的整体平移 [dlat, dlon]（度）
+  rot: 0,               // 手动旋转（度，逆时针为正）
   device: false,
   theme: "light",
   basemap: "minimal",   // minimal | osm
@@ -31,6 +35,13 @@ let boundariesMeta = [];
 let tracksMeta = [];
 let pollTimer = null;
 let lastData = null;      // 最近一次预览结果，供 resize 重绘
+let lastProj = null;      // 最近一次投影（含 .inv），拖动时要用
+let baseTrack = null;     // 未经手动平移的原始落点
+let baseCenter = null;
+let lastCanvas = null;    // 最近一次画布的 {W,H,pad}，用来限制拖拽范围
+let lastHandles = { pan: null, rot: null };   // 两个拖把当前的屏幕位置
+let drag = null;          // 正在拖动中的状态
+let evalTimer = null;
 let playState = { running: false, paused: false, external: null };
 let runningFile = null;   // 服务器上正在跑的文件名（tick 刷新）
 
@@ -138,6 +149,7 @@ function setMode(m) {
   const entering = m === "track";
   S.mode = m;
   store.set(K.mode, m);
+  S.pan = [0, 0]; S.rot = 0;            // 换模式，手动摆位作废
   // 圈数语义不同：图形一般 1 圈，操场一般 4 圈
   if (entering && S.laps < 2) S.laps = 4;
   if (!entering && S.laps > 6) S.laps = 1;
@@ -167,6 +179,7 @@ function setCampus(c) {
   if (!c) return;
   S.campus = c;
   store.set(K.campus, c);
+  S.pan = [0, 0]; S.rot = 0;            // 换校区，上一个校区的手动摆位没意义
   const meta = campusMeta(c);
   if (meta) S.boundary = meta.file;
   document.querySelectorAll("#campusSeg button").forEach(b => b.classList.toggle("on", b.dataset.c === c));
@@ -351,7 +364,216 @@ function syncBasemapChrome() {
 
 function toggleBasemap() { setBasemap(S.basemap === "osm" ? "minimal" : "osm"); }
 
-/* ---------------------------------------------------------------- 绘制 */
+/* ---------------------------------------------------------------- 手动摆位
+   预览图上有两个拖把，都是「形状不变」的刚体变换：
+     · 起点那个绿点      → 整条轨迹平移
+     · 图形外侧那个旋转钮 → 绕图形中心旋转
+   拖动过程纯本地重画、不发请求，所以是帧率级的顺滑；松手后才回后端
+   算一次精确余量（点到边界最短距离是 numpy 算的，前端算不了）。
+
+   四个坑：
+   1. 鼠标坐标 → SVG 坐标必须走 getScreenCTM().inverse()。
+      因为 preserveAspectRatio="xMidYMid meet" 会有 letterbox，
+      直接按元素宽高折算一定偏。
+   2. lastData.track 始终是「已经变换过」的，所以基准点另存 baseTrack；
+      否则第二次拖动会把位移/角度累加两遍。
+   3. 旋转必须换到「局部平面（米）」里做：经度一度和纬度一度的实际长度
+      差一个 cos(纬度)，直接在经纬度上转会把图形拉斜。
+   4. 旋转角逐帧累积差值，而不是每帧算绝对角 —— 跨过 ±180° 不会突然跳 360°。 */
+
+const HIT_R = 20;          // 抓手命中半径（SVG 用户单位）
+const ROT_SNAP = 15;       // 按住 Shift 时的角度吸附步长（度）
+const M_PER_DEG = 111320;
+
+function evtToLL(e) {
+  const svg = $("map");
+  const ctm = svg.getScreenCTM();
+  if (!ctm || !lastProj) return null;
+  const p = svg.createSVGPoint();
+  p.x = e.clientX; p.y = e.clientY;
+  const l = p.matrixTransform(ctm.inverse());
+  return { ll: lastProj.inv([l.x, l.y]), xy: [l.x, l.y] };
+}
+
+function panMeters() {
+  const [dlat, dlon] = S.pan;
+  const la = (baseCenter ? baseCenter[0] : 32.0) * Math.PI / 180;
+  return [dlon * M_PER_DEG * Math.cos(la), dlat * M_PER_DEG];    // [东, 北]
+}
+
+function hasPan() { return !!(S.pan[0] || S.pan[1]); }
+function hasManip() { return hasPan() || !!S.rot; }
+
+/* 绕 baseCenter 旋转 deg 度（逆时针为正）。在局部平面里转，保证形状不变形。 */
+function rotLL(pts, deg) {
+  if (!baseCenter || !deg) return pts;
+  const k = Math.cos(baseCenter[0] * Math.PI / 180);
+  const th = deg * Math.PI / 180, cs = Math.cos(th), sn = Math.sin(th);
+  return pts.map(([la, lo]) => {
+    const x = (lo - baseCenter[1]) * k * M_PER_DEG;     // 东
+    const y = (la - baseCenter[0]) * M_PER_DEG;         // 北
+    return [baseCenter[0] + (x * sn + y * cs) / M_PER_DEG,
+            baseCenter[1] + (x * cs - y * sn) / (k * M_PER_DEG)];
+  });
+}
+
+/* 先旋转、再平移。显示和生成共用这一份变换，保证所见即所得。 */
+function xformTrack(pts) {
+  if (!baseCenter || !pts) return pts;
+  let out = S.rot ? rotLL(pts, S.rot) : pts;
+  if (hasPan()) out = out.map(([la, lo]) => [la + S.pan[0], lo + S.pan[1]]);
+  return out;
+}
+
+/* 图形中心当前在哪（旋转不移动中心，只有平移会） */
+function centerNow() {
+  return baseCenter ? [baseCenter[0] + S.pan[0], baseCenter[1] + S.pan[1]] : null;
+}
+
+/* 某经纬度相对图形中心的方位角：0° = 正东，逆时针为正 */
+function angAt(ll) {
+  const c = centerNow();
+  if (!c || !ll) return 0;
+  const k = Math.cos(c[0] * Math.PI / 180);
+  return Math.atan2((ll[0] - c[0]) * M_PER_DEG,
+                    (ll[1] - c[1]) * k * M_PER_DEG) * 180 / Math.PI;
+}
+
+/* 限制拖拽范围：越界是允许的，但不许把轨迹挪到「连抓手都看不见」的地方 ——
+   那会让人以为功能坏了。抓手在起点上，所以**起点必须留在画布可视区内**。
+   用画布像素坐标来卡，比按校界包围盒卡更准（画布还有留白和 letterbox）。 */
+function clampPan(pan) {
+  if (!lastProj || !lastCanvas || !baseTrack) return pan;
+  const a = rotLL(baseTrack.slice(0, 1), S.rot)[0];     // 旋转之后的起点
+  const [x, y] = lastProj([a[0] + pan[0], a[1] + pan[1]]);
+  const { W, H, pad } = lastCanvas;
+  const cx = clamp(x, pad, W - pad);
+  const cy = clamp(y, pad, H - pad);
+  if (cx === x && cy === y) return pan;
+  const back = lastProj.inv([cx, cy]);
+  return [back[0] - a[0], back[1] - a[1]];
+}
+
+function applyManip(d) {
+  if (!d || !d.track || d.kind === "track" || !hasManip() || !baseTrack) return d;
+  return Object.assign({}, d, {
+    track: xformTrack(baseTrack),
+    center: centerNow(),
+    manual: true,
+  });
+}
+
+function syncPan() {
+  const on = hasManip();
+  const btn = $("btnReset");
+  if (btn) btn.classList.toggle("hidden", !on);
+  const el = $("panHint");
+  if (!el) return;
+  if (!on) { el.textContent = "拖绿点挪位置，拖外侧圆钮转角度"; return; }
+  const parts = [];
+  if (hasPan()) {
+    const [east, north] = panMeters();
+    parts.push(`<b>${east >= 0 ? "东" : "西"} ${Math.abs(east).toFixed(0)} m</b>` +
+               ` · <b>${north >= 0 ? "北" : "南"} ${Math.abs(north).toFixed(0)} m</b>`);
+  }
+  if (S.rot) parts.push(`<b>旋转 ${S.rot > 0 ? "+" : ""}${S.rot.toFixed(1)}°</b>`);
+  el.innerHTML = "已手动摆位：" + parts.join(" · ");
+}
+
+function resetManip() {
+  if (!hasManip()) return;
+  S.pan = [0, 0];
+  S.rot = 0;
+  syncPan();
+  refresh();
+}
+
+function scheduleEval() {
+  clearTimeout(evalTimer);
+  evalTimer = setTimeout(runEval, 150);
+}
+
+async function runEval() {
+  if (!lastData || lastData.kind === "track") return;
+  if (!hasManip()) return;              // 没手动动过，后端 preview 的值就是准的
+  try {
+    const ev = await api("/api/eval", {
+      points: lastData.track, boundary: S.boundary, margin: S.margin,
+    });
+    // 只取「余量」这几个字段。center 是后端按顶点算的形心，跟图形中心不是一回事，
+    // 拿它覆盖会让旋转钮的位置微微漂移。
+    const { center, points, boundary, ...rest } = ev;
+    Object.assign(lastData, rest);
+    drawMap();
+    renderStats(lastData);
+  } catch (e) { /* 服务没起来就静默，下次拖动再试 */ }
+}
+
+function onDragDown(e) {
+  if (!lastData || lastData.kind === "track" || !lastProj) return;
+  if (e.button) return;                 // 只认左键 / 触摸
+  const hit = evtToLL(e);
+  if (!hit) return;
+  const near = (q) => q && Math.hypot(hit.xy[0] - q[0], hit.xy[1] - q[1]) <= HIT_R;
+  let mode = null;
+  if (near(lastHandles.rot)) mode = "rot";
+  else if (near(lastHandles.pan)) mode = "pan";
+  if (!mode) return;
+
+  drag = { mode, moved: false };
+  if (mode === "pan") {
+    drag.start = hit.ll;
+    drag.basePan = S.pan.slice();
+  } else {
+    drag.acc = 0;                       // 角度累计（度）
+    drag.lastAng = angAt(hit.ll);
+    drag.baseRot = S.rot;
+  }
+  const svg = $("map");
+  try { svg.setPointerCapture(e.pointerId); } catch (_) {}
+  svg.classList.add("dragging");
+  e.preventDefault();
+}
+
+function onDragMove(e) {
+  if (!drag) return;
+  const hit = evtToLL(e);
+  if (!hit) return;
+
+  if (drag.mode === "pan") {
+    const dlat = hit.ll[0] - drag.start[0], dlon = hit.ll[1] - drag.start[1];
+    if (!drag.moved && Math.hypot(dlat, dlon) * M_PER_DEG < 2.5) return;   // 2.5 m 内算手抖
+    drag.moved = true;
+    S.pan = clampPan([drag.basePan[0] + dlat, drag.basePan[1] + dlon]);
+  } else {
+    let d = angAt(hit.ll) - drag.lastAng;
+    if (d > 180) d -= 360;
+    if (d < -180) d += 360;
+    drag.lastAng += d;
+    drag.acc += d;
+    if (!drag.moved && Math.abs(drag.acc) < 1.0) return;                   // 1° 内算手抖
+    drag.moved = true;
+    S.rot = drag.baseRot + drag.acc;
+    if (e.shiftKey) S.rot = Math.round(S.rot / ROT_SNAP) * ROT_SNAP;       // Shift 吸附
+  }
+
+  lastData.track = xformTrack(baseTrack);
+  lastData.center = centerNow();
+  lastData.manual = true;
+  drawMap();
+  syncPan();
+  e.preventDefault();
+}
+
+function onDragUp(e) {
+  if (!drag) return;
+  const moved = drag.moved;
+  drag = null;
+  const svg = $("map");
+  svg.classList.remove("dragging");
+  try { svg.releasePointerCapture(e.pointerId); } catch (_) {}
+  if (moved) { syncPan(); scheduleEval(); }
+}
 function drawMap() {
   if (!lastData) return;
   const d = lastData;
@@ -360,6 +582,7 @@ function drawMap() {
   const W = Math.max(360, Math.round(wrap.clientWidth || rect.width || 900));
   const H = Math.max(260, Math.round(wrap.clientHeight || rect.height || 620));
   const pad = clamp(Math.min(W, H) * 0.09, 34, 76);
+  lastCanvas = { W, H, pad };        // 拖拽范围限制要用
   const osm = S.basemap === "osm";
   const dark = S.theme === "dark";
 
@@ -375,6 +598,7 @@ function drawMap() {
 
   const ring = d.view || d.boundary || d.track;
   const proj = makeProj(ring, W, H, pad);
+  lastProj = proj;                   // 拖动时要用它的反投影
   const path = (pts) => pts.map(p => {
     const [x, y] = proj(p);
     return x.toFixed(1) + "," + y.toFixed(1);
@@ -436,8 +660,10 @@ function drawMap() {
   const [ex, ey] = proj(d.track[d.track.length - 1]);
   const [clx, cly] = proj(d.center);
   const sameEnds = Math.abs(sx - ex) < 1.5 && Math.abs(sy - ey) < 1.5;
-  const bad = d.kind !== "track" && d.margin_m <= 0;
-  const trackColor = bad ? "#e0464b" : "url(#tg)";
+  // 越界超过 1 km（danger）才把轨迹染红；1 km 内的黄警告由画布上的警示条表达，
+  // 免得「正常橙」和「警告黄」在轨迹上糊成一片。
+  const lv = d.kind === "track" ? "ok" : (d.level || (d.margin_m > 0 ? "ok" : "warn"));
+  const trackColor = lv === "danger" ? "#e0464b" : "url(#tg)";
 
   // 描边（casing）让轨迹在真实地图上也清楚；极简模式本来就有对比，不加也罢
   if (osm) {
@@ -453,6 +679,43 @@ function drawMap() {
   }
   layers += `<circle cx="${sx.toFixed(1)}" cy="${sy.toFixed(1)}" r="${sw * 2}" fill="#25c06b"
               stroke="${casing}" stroke-width="2.5"/>`;
+
+  // 两个拖把：起点绿点 = 整体平移；图形外侧的圆钮 = 绕中心旋转。
+  // 只在图形模式给 —— 操场是真实跑道，位置和朝向都不能挪。
+  if (d.kind !== "track") {
+    lastHandles.pan = [sx, sy];
+    // 旋转钮放在图形中心正上方，离「最远的那个点」再外扩一点，免得压在轨迹上
+    let reach = 0;
+    for (const p of d.track) {
+      const [qx, qy] = proj(p);
+      reach = Math.max(reach, Math.hypot(qx - clx, qy - cly));
+    }
+    const knob = [clx, Math.max(22, cly - reach - 30)];
+    lastHandles.rot = knob;
+    layers += `<g class="rot">
+        <line class="rot-arm" x1="${clx.toFixed(1)}" y1="${cly.toFixed(1)}"
+              x2="${knob[0].toFixed(1)}" y2="${knob[1].toFixed(1)}"
+              stroke="${inkCol}" stroke-width="1.1" stroke-dasharray="4 4" opacity="0.7"/>
+        <circle class="rot-hit" cx="${knob[0].toFixed(1)}" cy="${knob[1].toFixed(1)}" r="${HIT_R}"/>
+        <circle class="rot-knob" cx="${knob[0].toFixed(1)}" cy="${knob[1].toFixed(1)}" r="8"
+                stroke="${casing}" stroke-width="2"/>
+        <path class="rot-glyph" d="${rotGlyph(knob[0], knob[1])}"
+              stroke="${casing}" stroke-width="1.8" fill="none" stroke-linecap="round"/>
+      </g>`;
+    layers += `<g class="grab">
+        <circle class="grab-hit" cx="${sx.toFixed(1)}" cy="${sy.toFixed(1)}" r="${HIT_R}"/>
+        <circle class="grab-ring" cx="${sx.toFixed(1)}" cy="${sy.toFixed(1)}"
+                r="${(sw * 3.4).toFixed(1)}" stroke="${casing}" stroke-width="0.9"/>
+      </g>`;
+    if (S.rot) {
+      layers += `<text x="${(knob[0] + 15).toFixed(1)}" y="${(knob[1] + 4).toFixed(1)}"
+          fill="${inkCol}" font-size="${fs - 1}" font-family="monospace"
+          stroke="${halo}" stroke-width="3" paint-order="stroke"
+          stroke-linejoin="round">${S.rot > 0 ? "+" : ""}${S.rot.toFixed(1)}°</text>`;
+    }
+  } else {
+    lastHandles.pan = lastHandles.rot = null;
+  }
 
   // 比例尺 + 罗盘 + 图形名（文字都带同色描边，压在瓦片上也读得清）
   const nice = [50, 100, 200, 250, 500, 1000, 2000].find(v => v >= 150 / proj.scale) || 2000;
@@ -488,6 +751,14 @@ function drawMap() {
 
 function escapeXml(s) {
   return String(s == null ? "" : s).replace(/[<>&"]/g, c => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;" }[c]));
+}
+
+/* 旋转钮里的那个「转一圈」小圆弧（纯装饰，提示这里能转） */
+function rotGlyph(cx, cy) {
+  const r = 3.8, a0 = -0.45 * Math.PI, a1 = 1.15 * Math.PI;
+  const x0 = cx + r * Math.cos(a0), y0 = cy + r * Math.sin(a0);
+  const x1 = cx + r * Math.cos(a1), y1 = cy + r * Math.sin(a1);
+  return `M ${x0.toFixed(1)} ${y0.toFixed(1)} A ${r} ${r} 0 1 1 ${x1.toFixed(1)} ${y1.toFixed(1)}`;
 }
 
 function checkTiles() {
@@ -530,17 +801,35 @@ function renderStats(d) {
   }
   const total = d.length_m * S.laps;
   const est = total / (1000 / S.pace);
-  const mOk = d.margin_m >= Math.max(10, S.margin * 0.9);
+  const lv = d.level || (d.margin_m > 0 ? "ok" : "warn");
+  const over = d.over_m || 0;
+  const mItem = lv === "ok"
+    ? `<span><span class="k">离边界</span><b class="${d.margin_m >= Math.max(10, S.margin * 0.9) ? "good" : "warn"}">${d.margin_m.toFixed(0)}</b> m</span>`
+    : `<span><span class="k">越界</span><b class="${lv}">${over >= 1000
+        ? (over / 1000).toFixed(2) + " km" : Math.round(over) + " m"}</b></span>`;
   $("stats").innerHTML = `
     <span><span class="k">轨迹长度</span><b>${(total / 1000).toFixed(2)}</b> km</span>
     <span><span class="k">预估用时</span><b>${fmtHM(est)}</b></span>
-    <span><span class="k">离边界</span><b class="${mOk ? "good" : "warn"}">${d.margin_m.toFixed(0)}</b> m</span>
+    ${mItem}
     <span><span class="k">顶点</span><b>${d.track.length}</b></span>
-    <span><span class="k">校园面积</span><b>${d.area_km2.toFixed(2)}</b> km²</span>
-    ${d.ok ? "" : '<span class="warn">已越过校界（仍可生成）</span>'}`;
-  $("placeHint").innerHTML = d.ok
-    ? `已放在 <code>${d.center[0].toFixed(5)}, ${d.center[1].toFixed(5)}</code>，离边界最小 <b>${d.margin_m.toFixed(0)} m</b>`
-    : `<span style="color:#e0464b">图形比校界还大（余量 ${d.margin_m.toFixed(0)} m）—— 照样能生成，只是会出界</span>`;
+    <span><span class="k">校园面积</span><b>${d.area_km2.toFixed(2)}</b> km²</span>`;
+
+  // 画布上的越界警示条：≤1 km 黄、>1 km 红（跟 stats 同一套 level）
+  const bw = $("boundWarn");
+  if (bw) {
+    if (lv === "ok") {
+      bw.classList.add("hidden");
+    } else {
+      bw.textContent = d.note || (lv === "danger" ? "图形越过校界超过 1 km" : "图形越过校界");
+      bw.className = "boundwarn " + lv;
+    }
+  }
+
+  $("placeHint").innerHTML = lv !== "ok"
+    ? `<span class="lv-${lv}">${escapeXml(d.note || "已越过校界")}</span>`
+    : (d.manual
+        ? `已手动摆位，离边界最小 <b>${d.margin_m.toFixed(0)} m</b> <span class="muted">（点「重置位置与角度」回到自动最优）</span>`
+        : `已放在 <code>${d.center[0].toFixed(5)}, ${d.center[1].toFixed(5)}</code>，离边界最小 <b>${d.margin_m.toFixed(0)} m</b>`);
 }
 
 /* ---------------------------------------------------------------- 预览 */
@@ -559,9 +848,12 @@ async function refresh() {
   if (!p) {
     // 这个校区没有内置跑道：清干净画布，别留一块空的 OSM 底和上一轮的标注
     lastData = null;
+    baseTrack = null;
+    baseCenter = null;
     $("map").dataset.ready = "";
     $("map").innerHTML = "";
     $("tileWarn").classList.add("hidden");
+    $("boundWarn").classList.add("hidden");
     $("emptyState").classList.remove("hidden");
     syncBasemapChrome();
     $("stats").innerHTML = '<span class="muted">这个校区还没有收录跑道 —— 切到「图形轨迹」画一个吧</span>';
@@ -571,10 +863,15 @@ async function refresh() {
   $("busy").classList.remove("hidden");
   try {
     const d = await api("/api/preview", p);
-    lastData = d;
+    // 原始落点单独留一份：拖动时以它为基准，避免平移量被累加两遍
+    baseTrack = d.track;
+    baseCenter = d.center;
+    lastData = applyManip(d);
+    lastProj = null;              // 重新投影前先作废，免得 resize 间隙用旧投影
     syncBasemapChrome();
+    syncPan();
     drawMap();
-    renderStats(d);
+    renderStats(lastData);
   } catch (e) {
     $("stats").innerHTML = `<span class="warn">预览失败：${e.message}</span>`;
   } finally {
@@ -595,11 +892,15 @@ async function doGenerate() {
       laps: S.laps, pace: fmtPace(S.pace),
       pace_ramp: S.rampOn ? `${fmtPace(S.rampA)},${fmtPace(S.rampB)}` : null,
       out_name: $("outName").value.trim() || null,
+      jitter: S.jitter,              // GPS 漂移（米）
+      pace_noise: S.noise / 100,     // 配速波动（0~0.3）
     };
     const p = S.mode === "track"
       ? Object.assign({ track: S.track, direction: S.direction }, base)
       : Object.assign({ shape: S.shape, boundary: S.boundary, size: S.size,
-                        margin: S.margin, laps_mode: S.lapsMode }, base);
+                        margin: S.margin, laps_mode: S.lapsMode,
+                        // 手动摆位过就按这点列出 GPX（所见即所得）；没摆过交给后端搜最优落点
+                        points: (hasManip() && lastData) ? lastData.track : null }, base);
     const r = await api("/api/generate", p);
     let line = `已生成 <b>${r.file}</b> · ${fmtM(r.length_m)} · ${r.duration_hms}`;
     if (r.kind === "track") {
@@ -610,7 +911,11 @@ async function doGenerate() {
         ? `<span style="color:#25c06b">全部在界内</span>`
         : `<span style="color:#e0464b">有 ${c.out_of_bounds} 点在界外</span>`}`;
     }
-    if (r.warning) line += `<br><span style="color:#e8a13a">⚠ ${escapeXml(r.warning)}</span>`;
+    if (r.warning) {
+      const col = r.level === "danger" ? "#e0464b" : "#e8a13a";
+      const mark = r.level === "danger" ? "⛔" : "⚠";
+      line += `<br><span style="color:${col}">${mark} ${escapeXml(r.warning)}</span>`;
+    }
     $("genHint").innerHTML = line;
     await loadRoutes(r.file);
   } catch (e) {
@@ -686,7 +991,12 @@ function syncDown() {
 async function loadDevice() {
   const el = $("dev");
   try {
-    const d = await api("/api/device");
+    // 这里不能用 api()：没插设备时 /api/device **正常返回 200**，
+    // 只是带了个 error 字段说明原因，而 api() 见到 error 就当失败抛异常
+    // —— 那样会永远走到「服务没起来」那支，把「未发现设备」的提示吞掉。
+    const res = await fetch("/api/device");
+    const d = await res.json().catch(() => ({ error: "响应不是 JSON" }));
+    if (!res.ok) throw new Error(d.error || `HTTP ${res.status}`);
     S.device = !!d.connected;
     if (d.connected) {
       el.className = "dev ok";
@@ -937,7 +1247,24 @@ function bind() {
   };
   $("rampA").oninput = e => { S.rampA = +e.target.value; $("rampAOut").textContent = fmtPace(S.rampA); };
   $("rampB").oninput = e => { S.rampB = +e.target.value; $("rampBOut").textContent = fmtPace(S.rampB); };
+  $("noise").oninput = e => {
+    S.noise = +e.target.value;
+    $("noiseOut").textContent = "±" + S.noise + "%";
+  };
+  $("jitter").oninput = e => {
+    S.jitter = +e.target.value;
+    $("jitterOut").textContent = S.jitter.toFixed(1) + " m";
+  };
+  $("btnReset").onclick = resetManip;
   $("trackSel").onchange = () => { S.track = $("trackSel").value; store.set(K.track, S.track); syncTrackLen(); refresh(); };
+
+  // 拖动摆位：事件绑在 SVG 根上（overlay 每次重画都会重建，绑在子元素上会丢）
+  const svg = $("map");
+  svg.addEventListener("pointerdown", onDragDown);
+  svg.addEventListener("pointermove", onDragMove);
+  svg.addEventListener("pointerup", onDragUp);
+  svg.addEventListener("pointercancel", onDragUp);
+  svg.addEventListener("lostpointercapture", onDragUp);
 
   document.querySelectorAll("#lapsMode button").forEach(b => {
     b.onclick = () => {
@@ -971,6 +1298,13 @@ function bind() {
   S.mode = store.get(K.mode, "shape") === "track" ? "track" : "shape";
   S.basemap = store.get(K.basemap, "minimal") === "osm" ? "osm" : "minimal";
   S.track = store.get(K.track, "");
+
+  // 滑块显示跟 S 对齐（HTML 里写死的 value 只作首帧兜底）
+  $("size").value = S.size; $("sizeOut").textContent = S.size + " m";
+  $("margin").value = S.margin; $("marginOut").textContent = S.margin + " m";
+  $("pace").value = S.pace; $("paceOut").textContent = fmtPace(S.pace) + " /km";
+  $("noise").value = S.noise; $("noiseOut").textContent = "±" + S.noise + "%";
+  $("jitter").value = S.jitter; $("jitterOut").textContent = S.jitter.toFixed(1) + " m";
 
   bind();
   watchResize();
