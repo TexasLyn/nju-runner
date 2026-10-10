@@ -147,7 +147,8 @@
     <button class="ctlb run" id="btnPlay" type="button" title="按所选路线把轨迹回放到手机">
       <b>②</b>开始模拟
     </button>
-    <button class="ctlb wait" id="btnPause" type="button" disabled title="冻结注入，随时继续，不丢进度">
+    <button class="ctlb wait" id="btnPause" type="button" disabled
+            title="冻结轨迹注入，随时继续、不丢进度。注意：手机端的运动 App 不会跟着停，请手动也暂停记录">
       <b>③</b>暂停
     </button>
     <button class="ctlb stop" id="btnRelease" type="button" title="停回放 + 释放定点；若手机仍停在旧位置，需拔一次数据线">
@@ -157,6 +158,15 @@
       <div class="prog"><div id="bar"></div></div>
       <span id="progText">未在回放</span>
     </div>
+  </div>
+
+  <p class="dockhint" id="pauseHint"></p>
+
+  <div class="dockfoot">
+    <span class="credit">思路来自同学的项目
+      <a href="https://github.com/macanine/zhangxuefeng" target="_blank" rel="noopener noreferrer"
+         title="macanine / zhangxuefeng —— Python + Flask + Leaflet 的校园轨迹画板">zhangxuefeng</a>
+      · 谢了兄弟</span>
   </div>
 </footer>
 

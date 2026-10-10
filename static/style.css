@@ -251,6 +251,27 @@ select{
 #progText.live{color:var(--start); font-weight:600}
 #progText.pause{color:var(--wait); font-weight:600}
 
+/* 暂停提醒：手机端不跟着停，配速会被静止时间拖垮 */
+.dockhint{
+  margin:0; font-size:11.5px; line-height:1.5; color:var(--ink3);
+  display:flex; gap:6px; align-items:flex-start;
+}
+.dockhint b{font-weight:650; color:var(--ink2)}
+.dockhint.on{color:var(--wait-ink)}
+.dockhint.on b{color:var(--wait-ink)}
+:root[data-theme="dark"] .dockhint.on{color:var(--wait)}
+
+/* 页脚致谢（刻意做小） */
+.dockfoot{display:flex; justify-content:flex-end; align-items:center}
+.dockfoot .credit{font-size:10.5px; color:var(--ink3); opacity:.6; letter-spacing:.1px}
+.dockfoot .credit:hover{opacity:.9}
+.dock .dockfoot a{
+  padding:0 !important; border:0 !important; background:none !important;
+  color:inherit; font-size:10.5px; font-weight:500; border-bottom:1px dotted currentColor;
+  border-radius:0;
+}
+.dock .dockfoot a:hover{color:var(--ink2); border-color:transparent}
+
 /* ---------------------------------------------------------------- 窄屏 */
 @media (max-width:980px){
   main{grid-template-columns:minmax(0,1fr); grid-template-rows:minmax(0,1fr) auto}

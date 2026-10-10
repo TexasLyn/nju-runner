@@ -303,10 +303,27 @@ async function loadDevice() {
 }
 
 /* ---------------------------------------------------------------- 模拟控制 */
+/* 「暂停」的坑：网页暂停只冻住轨迹注入，手机端运动 App 照旧在计时。
+   静止那段时间会被算进总时长 → 平均配速被拖下来 → 配速不达标。
+   所以暂停键必须自带这条提醒，且暂停期间高亮。 */
+const PAUSE_HINT_IDLE =
+  "<b>③ 暂停</b> 只冻结轨迹注入 —— 手机端运动 App 不会跟着停，" +
+  "请手动也点暂停；否则静止这段时间会计进总时长，平均配速直接掉下来（配速不达标）。继续时也一起恢复。";
+const PAUSE_HINT_ON =
+  "<b>已暂停 ·</b> 确认一下手机端运动 App 也已暂停，不然配速不达标；点「继续」后记得在手机端一起恢复。";
+
 function setProg(txt, cls) {
   const el = $("progText");
   el.textContent = txt;
   el.className = cls || "";
+}
+
+function renderPauseHint() {
+  const el = $("pauseHint");
+  if (!el) return;
+  const on = !!playState.running && !!playState.paused;
+  el.innerHTML = on ? PAUSE_HINT_ON : PAUSE_HINT_IDLE;
+  el.classList.toggle("on", on);
 }
 
 function syncButtons() {
@@ -324,13 +341,14 @@ function syncButtons() {
   const pb = $("btnPause");
   if (paused) {
     pb.innerHTML = "<b>③</b>继续";
-    pb.title = "解冻注入，从断点接着跑";
+    pb.title = "解冻注入，从断点接着跑。回到手机端把运动 App 也一起恢复";
     pb.classList.add("on");
   } else {
     pb.innerHTML = "<b>③</b>暂停";
-    pb.title = "冻结注入，随时继续，不丢进度";
+    pb.title = "冻结轨迹注入，不丢进度。注意：手机端运动 App 不会跟着停，请手动也暂停记录";
     pb.classList.remove("on");
   }
+  renderPauseHint();
 }
 
 async function doPrime() {
@@ -385,10 +403,10 @@ async function doPause() {
   try {
     if (playState.paused) {
       await api("/api/resume", {});
-      setProg("已继续", "live");
+      setProg("已继续 · 记得把手机端运动记录也恢复", "live");
     } else {
       const r = await api("/api/pause", {});
-      setProg(`已暂停（冻结 ${r.frozen} 个注入进程）· 点「继续」接着跑`, "pause");
+      setProg(`已暂停（冻结 ${r.frozen} 个注入进程）· 手机端也要暂停记录，否则配速不达标`, "pause");
     }
   } catch (e) {
     alert("操作失败：" + e.message);
@@ -430,7 +448,7 @@ async function tick() {
       const pct = (s.progress * 100).toFixed(0);
       setProg(
         `${s.gpx} · ${pct}%（${s.pushed}/${s.total} 点）· 已跑 ${s.elapsed_hms} / ${s.expected_hms}` +
-        (s.paused ? " · 已暂停" : ""),
+        (s.paused ? " · 已暂停（手机端记得也暂停记录）" : ""),
         s.paused ? "pause" : "live");
     } else if (s.external) {
       $("bar").style.width = "0%";
