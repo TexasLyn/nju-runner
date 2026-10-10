@@ -1,30 +1,43 @@
 /* NJU Runner · 前端交互
    状态 → 防抖预览 → 按容器尺寸画 SVG；生成 / 注入 / 起播 / 暂停 / 结束 走 REST。
-   主题：localStorage 记忆；没存过就跟随系统（prefers-color-scheme）。 */
+   主题：localStorage 记忆；没存过就跟随系统（prefers-color-scheme）。
+   路线：图形（校界内自动落点） / 操场（OSM 真实跑道，沿轮廓跑 N 圈）。
+   底图：极简（自绘网格，恒深色） / 真实地图（OSM 瓦片，走后端代理 + 本地缓存）。 */
 
 const $ = (id) => document.getElementById(id);
 
 const S = {
-  shape: "heart",
+  mode: "shape",        // shape | track
+  campus: "xianlin",    // gulou | xianlin | pukou | suzhou
   boundary: "boundary-nju-xianlin.geojson",
+  shape: "heart",
+  track: "",            // 操场文件名
+  direction: "ccw",
   size: 560,
   margin: 60,
   laps: 1,
   lapsMode: "retrace",
-  pace: 360,          // 秒/km
+  pace: 360,            // 秒/km
   rampOn: false,
   rampA: 450,
   rampB: 270,
   device: false,
   theme: "light",
+  basemap: "minimal",   // minimal | osm
 };
 
 let shapesMeta = {};
+let boundariesMeta = [];
+let tracksMeta = [];
 let pollTimer = null;
 let lastData = null;      // 最近一次预览结果，供 resize 重绘
 let playState = { running: false, paused: false, external: null };
 let runningFile = null;   // 服务器上正在跑的文件名（tick 刷新）
-const ROUTE_KEY = "njurunner.route";
+
+const K = {
+  route: "njurunner.route", theme: "njurunner.theme", campus: "njurunner.campus",
+  mode: "njurunner.mode", basemap: "njurunner.basemap", track: "njurunner.track",
+};
 
 const fmtPace = (s) => `${Math.floor(s / 60)}'${String(s % 60).padStart(2, "0")}"`;
 const fmtM = (m) => m >= 1000 ? (m / 1000).toFixed(2) + " km" : Math.round(m) + " m";
@@ -34,19 +47,19 @@ const fmtHM = (sec) => {
   return h ? `${h}时${m}分` : (m ? `${m}分${String(s).padStart(2, "0")}秒` : `${s}秒`);
 };
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const store = {
+  get(k, d) { try { return localStorage.getItem(k) || d; } catch (e) { return d; } },
+  set(k, v) { try { v ? localStorage.setItem(k, v) : localStorage.removeItem(k); } catch (e) {} },
+};
 
 /* ---------------------------------------------------------------- 主题 */
-const THEME_KEY = "njurunner.theme";
 const mqDark = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
-
-function storedTheme() {
-  try { return localStorage.getItem(THEME_KEY); } catch (e) { return null; }
-}
 
 function applyTheme(t, persist) {
   document.documentElement.dataset.theme = t;
   S.theme = t;
-  if (persist) { try { localStorage.setItem(THEME_KEY, t); } catch (e) { /* 隐私模式 */ } }
+  if (persist) store.set(K.theme, t);
+  if (lastData) drawMap();
 }
 
 function toggleTheme() {
@@ -63,7 +76,7 @@ async function api(path, body) {
   return data;
 }
 
-/* ---------------------------------------------------------------- 图形按钮 */
+/* ---------------------------------------------------------------- 加载元数据 */
 async function loadShapes() {
   const { shapes } = await api("/api/shapes");
   shapesMeta = {};
@@ -86,72 +99,297 @@ async function loadShapes() {
   });
 }
 
-/* ---------------------------------------------------------------- 投影与绘制 */
-function makeProj(boundary, W, H, pad) {
+async function loadBoundaries() {
+  const { boundaries } = await api("/api/boundaries");
+  boundariesMeta = boundaries;
+  const seg = $("campusSeg");
+  seg.innerHTML = "";
+  boundaries.forEach((b) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.dataset.c = b.campus || b.file;
+    btn.textContent = b.label || b.name;
+    btn.title = `${b.name} · ${b.area_km2} km² · ${b.file}`;
+    btn.onclick = () => setCampus(b.campus || b.file);
+    seg.appendChild(btn);
+  });
+  // 记住的校区不在列表里（删过文件）就退回第一个
+  const want = store.get(K.campus, S.campus);
+  setCampus(boundaries.some(b => b.campus === want) ? want : (boundaries[0] || {}).campus || "");
+}
+
+function campusMeta(c) {
+  return boundariesMeta.find(b => b.campus === c) || null;
+}
+
+async function loadTracks() {
+  try {
+    const { tracks } = await api("/api/tracks");
+    tracksMeta = tracks;
+  } catch (e) {
+    tracksMeta = [];
+  }
+  rebuildTrackSel();
+}
+
+/* ---------------------------------------------------------------- 模式 / 校区 */
+function setMode(m) {
+  if (m === S.mode) return;
+  const entering = m === "track";
+  S.mode = m;
+  store.set(K.mode, m);
+  // 圈数语义不同：图形一般 1 圈，操场一般 4 圈
+  if (entering && S.laps < 2) S.laps = 4;
+  if (!entering && S.laps > 6) S.laps = 1;
+  $("laps").value = S.laps;
+  $("lapsOut").textContent = S.laps + " 圈";
+  applyMode();
+  refresh();
+}
+
+function applyMode() {
+  const track = S.mode === "track";
+  $("shapes").classList.toggle("hidden", track);
+  $("trackOnlyHint").classList.toggle("hidden", !track);
+  $("trackBox").classList.toggle("hidden", !track);
+  $("blkPlace").classList.toggle("hidden", track);
+  $("lapsMode").classList.toggle("hidden", track);
+  $("dirSeg").classList.toggle("hidden", !track);
+  $("laps").max = track ? 12 : 6;
+  document.querySelectorAll("#modeSeg button").forEach(b => b.classList.toggle("on", b.dataset.v === S.mode));
+  document.querySelectorAll("#dirSeg button").forEach(b => b.classList.toggle("on", b.dataset.v === S.direction));
+  $("outName").placeholder = track ? "留空自动命名（track-…）" : "留空自动命名";
+  renderCampusHint();
+  renumber();
+}
+
+function setCampus(c) {
+  if (!c) return;
+  S.campus = c;
+  store.set(K.campus, c);
+  const meta = campusMeta(c);
+  if (meta) S.boundary = meta.file;
+  document.querySelectorAll("#campusSeg button").forEach(b => b.classList.toggle("on", b.dataset.c === c));
+  rebuildTrackSel();
+  renderCampusHint();
+  refresh();
+}
+
+function rebuildTrackSel() {
+  const sel = $("trackSel");
+  if (!sel) return;
+  const list = tracksMeta.filter(t => !t.error && t.campus === S.campus);
+  sel.innerHTML = "";
+  if (!tracksMeta.length) {
+    sel.appendChild(new Option("（没找到内置跑道）", ""));
+    S.track = "";
+    syncTrackLen();            // 必须清一次，否则会留着上一个校区的「400 m / 圈」
+    return;
+  }
+  if (!list.length) {
+    sel.appendChild(new Option("— 这个校区暂未收录跑道 —", ""));
+    S.track = "";
+    syncTrackLen();
+    return;
+  }
+  const remembered = store.get(K.track, "");
+  list.forEach(t => {
+    sel.appendChild(new Option(`${t.name} · ${Math.round(t.length_m)} m`, t.file));
+  });
+  const hit = list.some(t => t.file === remembered) ? remembered
+    : (list.some(t => t.file === S.track) ? S.track : list[0].file);
+  sel.value = hit;
+  S.track = hit;
+  store.set(K.track, hit);
+  syncTrackLen();
+}
+
+function syncTrackLen() {
+  const t = tracksMeta.find(z => z.file === $("trackSel").value);
+  $("trackLen").textContent = t ? `${Math.round(t.length_m)} m / 圈` : "";
+  const h = $("trackHint");
+  if (t) {
+    h.innerHTML = `${t.label || ""} · ${t.points} 个顶点 · ${t.source || ""}`;
+  } else {
+    h.textContent = "";
+  }
+}
+
+function renderCampusHint() {
+  const el = $("campusHint");
+  const m = campusMeta(S.campus);
+  if (S.mode === "track") {
+    const n = tracksMeta.filter(t => !t.error && t.campus === S.campus).length;
+    el.innerHTML = m
+      ? (n
+          ? `真实跑道取自 OpenStreetMap；本校区收录 <b>${n}</b> 条。`
+          : `真实跑道取自 OpenStreetMap；<span class="warn">本校区还没收录跑道，` +
+            `可先用「图形轨迹」画。</span>`)
+      : "（校区信息未加载）";
+    return;
+  }
+  el.innerHTML = m
+    ? `校界 <b>${m.area_km2}</b> km² · <b>${m.points}</b> 个顶点 · 中心 <code>${m.center[0].toFixed(5)}, ${m.center[1].toFixed(5)}</code>`
+    : "（校区信息未加载）";
+}
+
+/* 章节序号按「当前可见的块」重排 —— 操场模式下有几块是隐藏的 */
+function renumber() {
+  let i = 0;
+  document.querySelectorAll("#panel .block").forEach(b => {
+    if (b.classList.contains("hidden")) return;
+    i += 1;
+    const h = b.querySelector("h2");
+    if (h) h.textContent = `${i} · ${b.dataset.title || ""}`;
+  });
+}
+
+/* ---------------------------------------------------------------- 投影 */
+function makeProj(ring, W, H, pad) {
   const M = 111320;
-  const lats = boundary.map(p => p[0]), lons = boundary.map(p => p[1]);
+  const lats = ring.map(p => p[0]), lons = ring.map(p => p[1]);
   const la0 = (Math.min(...lats) + Math.max(...lats)) / 2;
   const lo0 = (Math.min(...lons) + Math.max(...lons)) / 2;
   const k = Math.cos(la0 * Math.PI / 180);
   const toXY = ([la, lo]) => [(lo - lo0) * k * M, (la - la0) * M];
-  const xy = boundary.map(toXY);
+  const xy = ring.map(toXY);
   const xs = xy.map(p => p[0]), ys = xy.map(p => p[1]);
   const x0 = Math.min(...xs), x1 = Math.max(...xs);
   const y0 = Math.min(...ys), y1 = Math.max(...ys);
-  const sc = Math.min((W - 2 * pad) / (x1 - x0), (H - 2 * pad) / (y1 - y0));
+  const sc = Math.min((W - 2 * pad) / Math.max(1e-6, x1 - x0),
+                      (H - 2 * pad) / Math.max(1e-6, y1 - y0));
   const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
   const f = ([la, lo]) => {
     const [x, y] = toXY([la, lo]);
     return [W / 2 + (x - cx) * sc, H / 2 - (y - cy) * sc];
   };
   f.scale = sc;
+  // 反投影：OSM 瓦片要按「屏幕四角对应哪块瓦片」来铺，必须有逆变换
+  f.inv = ([px, py]) => {
+    const x = (px - W / 2) / sc + cx;
+    const y = -(py - H / 2) / sc + cy;
+    return [la0 + y / M, lo0 + x / (k * M)];
+  };
   return f;
 }
 
+/* ---------------------------------------------------------------- OSM 瓦片 */
+const MERC_Z0 = 156543.03392;          // z=0 赤道处的 m/px
+const TILE_PX = 256;
+
+const lon2tx = (lon, z) => Math.floor((lon + 180) / 360 * Math.pow(2, z));
+function lat2ty(lat, z) {
+  const r = lat * Math.PI / 180;
+  return Math.floor((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2 * Math.pow(2, z));
+}
+const tx2lon = (tx, z) => tx / Math.pow(2, z) * 360 - 180;
+function ty2lat(ty, z) {
+  const n = Math.PI - 2 * Math.PI * ty / Math.pow(2, z);
+  return 180 / Math.PI * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+}
+
+let tileKey = "";
+let tileHTML = "";
+
+function buildTiles(proj, W, H) {
+  const [laA, loA] = proj.inv([0, 0]);
+  const [laB, loB] = proj.inv([W, H]);
+  const latN = Math.max(laA, laB), latS = Math.min(laA, laB);
+  const lonW = Math.min(loA, loB), lonE = Math.max(loA, loB);
+
+  const mpp = 1 / proj.scale;                       // 屏幕上一像素代表多少米
+  const latC = (latN + latS) / 2;
+  let z = clamp(Math.round(Math.log2(MERC_Z0 * Math.cos(latC * Math.PI / 180) / mpp)), 2, 19);
+  let tx0, tx1, ty0, ty1;
+  for (; z > 2; z--) {                              // 控制请求量：一张 256px 的瓦片批量别太大
+    tx0 = lon2tx(lonW, z) - 1; tx1 = lon2tx(lonE, z) + 1;
+    ty0 = lat2ty(latN, z) - 1; ty1 = lat2ty(latS, z) + 1;
+    if ((tx1 - tx0 + 1) * (ty1 - ty0 + 1) <= 40) break;
+  }
+  tx0 = Math.max(0, tx0); ty0 = Math.max(0, ty0);
+  const lim = Math.pow(2, z) - 1;
+  tx1 = Math.min(lim, tx1); ty1 = Math.min(lim, ty1);
+
+  const key = `${z}|${tx0}|${ty0}|${tx1}|${ty1}|${W}x${H}|${Math.round(proj.scale * 1e6)}`;
+  if (key === tileKey && tileHTML) return tileHTML;   // 参数没变就复用，避免拖滑块时反复请求
+
+  window.__tileFail = 0; window.__tileOk = 0;
+  let out = "";
+  for (let tx = tx0; tx <= tx1; tx++) {
+    for (let ty = ty0; ty <= ty1; ty++) {
+      const [x1, y1] = proj([ty2lat(ty, z), tx2lon(tx, z)]);
+      const [x2, y2] = proj([ty2lat(ty + 1, z), tx2lon(tx + 1, z)]);
+      const X = Math.min(x1, x2), Y = Math.min(y1, y2);
+      const w = Math.abs(x2 - x1) + 0.6, h = Math.abs(y2 - y1) + 0.6;
+      out += `<image href="/api/tile?z=${z}&x=${tx}&y=${ty}" x="${X.toFixed(1)}" y="${Y.toFixed(1)}"`
+           + ` width="${w.toFixed(1)}" height="${h.toFixed(1)}" preserveAspectRatio="none"`
+           + ` onload="window.__tileOk=(window.__tileOk||0)+1"`
+           + ` onerror="window.__tileFail=(window.__tileFail||0)+1"/>`;
+    }
+  }
+  tileKey = key; tileHTML = out;
+  return out;
+}
+
+function setBasemap(v) {
+  S.basemap = v;
+  store.set(K.basemap, v);
+  if (v !== "osm") { $("tileWarn").classList.add("hidden"); tileKey = ""; tileHTML = ""; }
+  syncBasemapChrome();
+  if (lastData) drawMap();
+}
+
+/* 底图相关的三处 UI 只在这里改，避免 setBasemap / refresh / 空状态各写一遍写岔。
+   「真实地图」只有在真有图可画时才算生效 —— 空状态下按钮该显示的是「点它能去哪」。 */
+function syncBasemapChrome() {
+  const on = S.basemap === "osm" && !!lastData;
+  $("btnMap").classList.toggle("on", on);
+  $("mapLabel").textContent = on ? "极简底图" : "真实地图";
+  $("osmAttrib").classList.toggle("hidden", !on);
+  $("canvasWrap").classList.toggle("osm", on);
+}
+
+function toggleBasemap() { setBasemap(S.basemap === "osm" ? "minimal" : "osm"); }
+
+/* ---------------------------------------------------------------- 绘制 */
 function drawMap() {
   if (!lastData) return;
   const d = lastData;
   const wrap = $("canvasWrap");
   const rect = wrap.getBoundingClientRect();
-  // 布局未完成时 clientWidth/Height 可能是 0，退回 rect，再退回一个合理默认值；
-  // 真正的尺寸一旦确定，ResizeObserver 会再触发重绘。
   const W = Math.max(360, Math.round(wrap.clientWidth || rect.width || 900));
   const H = Math.max(260, Math.round(wrap.clientHeight || rect.height || 620));
   const pad = clamp(Math.min(W, H) * 0.09, 34, 76);
+  const osm = S.basemap === "osm";
+  const dark = S.theme === "dark";
 
   const svg = $("map");
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  if (!svg.dataset.ready) {          // 三层：底 → 瓦片 → 覆盖物（分开更新，避免瓦片被反复重建）
+    svg.innerHTML = '<g class="back"></g><g class="tiles"></g><g class="overlay"></g>';
+    svg.dataset.ready = "1";
+  }
+  const gBack = svg.querySelector("g.back");
+  const gTiles = svg.querySelector("g.tiles");
+  const gOver = svg.querySelector("g.overlay");
 
-  const proj = makeProj(d.boundary, W, H, pad);
+  const ring = d.view || d.boundary || d.track;
+  const proj = makeProj(ring, W, H, pad);
   const path = (pts) => pts.map(p => {
     const [x, y] = proj(p);
     return x.toFixed(1) + "," + y.toFixed(1);
   }).join(" ");
 
-  const bp = path(d.boundary);
-  const tp = path(d.track);
-  const [sx, sy] = proj(d.track[0]);
-  const [ex, ey] = proj(d.track[d.track.length - 1]);
-  const [clx, cly] = proj(d.center);
-  const sameEnds = Math.abs(sx - ex) < 1.5 && Math.abs(sy - ey) < 1.5;
-
-  // 网格
   const step = Math.round(clamp(Math.min(W, H) / 8, 46, 96));
+  const canvasBg = osm ? (dark ? "#171b21" : "#e9e5de") : "#0f1218";
+
+  /* ---- 底层：背景 + 网格（极简模式才画网格）---- */
   let grid = "";
-  for (let x = 0; x <= W; x += step) grid += `<line x1="${x}" y1="0" x2="${x}" y2="${H}"/>`;
-  for (let y = 0; y <= H; y += step) grid += `<line x1="0" y1="${y}" x2="${W}" y2="${y}"/>`;
-
-  // 比例尺
-  const nice = [50, 100, 200, 250, 500, 1000, 2000].find(v => v >= 150 / proj.scale) || 2000;
-  const barPx = nice * proj.scale;
-  const bx = W - 34 - barPx, by = H - 30;
-  const fs = clamp(Math.min(W, H) / 52, 11, 16);
-  const sw = clamp(Math.min(W, H) / 190, 2.2, 4.4);          // 轨迹线宽
-  const bw = clamp(Math.min(W, H) / 400, 1.4, 2.4);          // 边界线宽
-
-  const trackColor = d.margin_m > 0 ? "url(#tg)" : "#e0464b";
-
-  svg.innerHTML = `
+  if (!osm) {
+    for (let x = 0; x <= W; x += step) grid += `<line x1="${x}" y1="0" x2="${x}" y2="${H}"/>`;
+    for (let y = 0; y <= H; y += step) grid += `<line x1="0" y1="${y}" x2="${W}" y2="${y}"/>`;
+  }
+  gBack.innerHTML = `
     <defs>
       <pattern id="g" width="${step}" height="${step}" patternUnits="userSpaceOnUse">
         <path d="M ${step} 0 L 0 0 0 ${step}" fill="none" stroke="#1a2029" stroke-width="1"/>
@@ -160,30 +398,111 @@ function drawMap() {
         <stop offset="0" stop-color="#ffb457"/><stop offset="1" stop-color="#ff7a45"/>
       </linearGradient>
     </defs>
-    <rect width="${W}" height="${H}" fill="#0f1218"/>
-    <rect width="${W}" height="${H}" fill="url(#g)"/>
-    <polygon points="${bp}" fill="#16283c" stroke="#5f9ce0" stroke-width="${bw}"
-             stroke-linejoin="round" opacity="0.95"/>
-    <polyline points="${tp}" fill="none" stroke="${trackColor}" stroke-width="${sw}"
-              stroke-linejoin="round" stroke-linecap="round"/>
-    <circle cx="${clx.toFixed(1)}" cy="${cly.toFixed(1)}" r="3" fill="#ffffff" opacity="0.28"/>
-    ${sameEnds ? "" : `<circle cx="${ex.toFixed(1)}" cy="${ey.toFixed(1)}" r="${sw * 2}"
-              fill="#e0464b" stroke="#0f1218" stroke-width="2.5"/>`}
-    <circle cx="${sx.toFixed(1)}" cy="${sy.toFixed(1)}" r="${sw * 2}" fill="#25c06b"
-            stroke="#0f1218" stroke-width="2.5"/>
-    <g stroke="#8ea4bf" stroke-width="1.8">
+    <rect width="${W}" height="${H}" fill="${canvasBg}"/>
+    ${grid ? `<rect width="${W}" height="${H}" fill="url(#g)"/>` : ""}`;
+
+  /* ---- 瓦片层 ---- */
+  gTiles.innerHTML = osm ? buildTiles(proj, W, H) : "";
+
+  /* ---- 覆盖层：校界 / 跑道 / 起终点 / 文字 ---- */
+  const inkCol = osm ? (dark ? "#e8eef7" : "#25313f") : "#8ea4bf";
+  const halo = canvasBg;
+  const casing = osm ? (dark ? "#0b0e13" : "#ffffff") : "#0f1218";
+  const sw = clamp(Math.min(W, H) / 190, 2.2, 4.4);
+  const bw = clamp(Math.min(W, H) / 400, 1.4, 2.4);
+  const fs = clamp(Math.min(W, H) / 52, 11, 16);
+
+  let layers = "";
+
+  // 校界：极简模式填充；真实地图模式只描边 + 淡填充（别把地图糊住）
+  if (d.boundary) {
+    const bp = path(d.boundary);
+    layers += osm
+      ? `<polygon points="${bp}" fill="${dark ? "rgba(79,143,232,.13)" : "rgba(47,111,208,.10)"}"
+                  stroke="${dark ? "#7cb0f4" : "#2f6fd0"}" stroke-width="${bw}"
+                  stroke-linejoin="round" stroke-dasharray="7 5" opacity="0.95"/>`
+      : `<polygon points="${bp}" fill="#16283c" stroke="#5f9ce0" stroke-width="${bw}"
+                  stroke-linejoin="round" opacity="0.95"/>`;
+  }
+  // 操场模式：校园轮廓给一条很淡的虚线做参照
+  if (osm && d.campus_boundary) {
+    layers += `<polygon points="${path(d.campus_boundary)}" fill="none"
+                stroke="${dark ? "rgba(160,190,230,.45)" : "rgba(47,111,208,.42)"}"
+                stroke-width="${bw}" stroke-dasharray="4 6"/>`;
+  }
+
+  const tp = path(d.track);
+  const [sx, sy] = proj(d.track[0]);
+  const [ex, ey] = proj(d.track[d.track.length - 1]);
+  const [clx, cly] = proj(d.center);
+  const sameEnds = Math.abs(sx - ex) < 1.5 && Math.abs(sy - ey) < 1.5;
+  const bad = d.kind !== "track" && d.margin_m <= 0;
+  const trackColor = bad ? "#e0464b" : "url(#tg)";
+
+  // 描边（casing）让轨迹在真实地图上也清楚；极简模式本来就有对比，不加也罢
+  if (osm) {
+    layers += `<polyline points="${tp}" fill="none" stroke="${casing}" stroke-width="${sw + 3.4}"
+                stroke-linejoin="round" stroke-linecap="round" opacity="0.9"/>`;
+  }
+  layers += `<polyline points="${tp}" fill="none" stroke="${trackColor}" stroke-width="${sw}"
+              stroke-linejoin="round" stroke-linecap="round"/>`;
+  layers += `<circle cx="${clx.toFixed(1)}" cy="${cly.toFixed(1)}" r="3" fill="#ffffff" opacity="0.28"/>`;
+  if (!sameEnds) {
+    layers += `<circle cx="${ex.toFixed(1)}" cy="${ey.toFixed(1)}" r="${sw * 2}"
+                fill="#e0464b" stroke="${casing}" stroke-width="2.5"/>`;
+  }
+  layers += `<circle cx="${sx.toFixed(1)}" cy="${sy.toFixed(1)}" r="${sw * 2}" fill="#25c06b"
+              stroke="${casing}" stroke-width="2.5"/>`;
+
+  // 比例尺 + 罗盘 + 图形名（文字都带同色描边，压在瓦片上也读得清）
+  const nice = [50, 100, 200, 250, 500, 1000, 2000].find(v => v >= 150 / proj.scale) || 2000;
+  const barPx = nice * proj.scale;
+  const bx = W - 34 - barPx, by = H - 30;
+  layers += `<g stroke="${inkCol}" stroke-width="1.8">
       <line x1="${bx}" y1="${by}" x2="${bx + barPx}" y2="${by}"/>
       <line x1="${bx}" y1="${by - 5}" x2="${bx}" y2="${by + 5}"/>
       <line x1="${bx + barPx}" y1="${by - 5}" x2="${bx + barPx}" y2="${by + 5}"/>
     </g>
-    <text x="${bx + barPx / 2}" y="${by - 10}" fill="#8ea4bf" font-size="${fs - 1}"
-          text-anchor="middle" font-family="monospace">${nice} m</text>
-    <text x="${W - 22}" y="${fs + 26}" fill="#7c8ea6" font-size="${fs + 10}" text-anchor="end"
-          font-family="-apple-system">N ↑</text>
-    <text x="${pad * 0.5}" y="${H - 14}" fill="#435063" font-size="${fs - 2}"
-          font-family="-apple-system">${d.shape_name}${d.rotation ? ` · 旋转 ${d.rotation}°` : ""}</text>
-  `;
+    <text x="${bx + barPx / 2}" y="${by - 10}" fill="${inkCol}" font-size="${fs - 1}"
+          text-anchor="middle" font-family="monospace" stroke="${halo}" stroke-width="3"
+          paint-order="stroke" stroke-linejoin="round">${nice} m</text>
+    <text x="${W - 22}" y="${fs + 42}" fill="${inkCol}" font-size="${fs + 10}" text-anchor="end"
+          font-family="-apple-system" stroke="${halo}" stroke-width="3.5"
+          paint-order="stroke" stroke-linejoin="round" opacity="${osm ? 0.85 : 1}">N ↑</text>
+    <text x="${pad * 0.5}" y="${H - 14}" fill="${inkCol}" font-size="${fs - 2}"
+          font-family="-apple-system" stroke="${halo}" stroke-width="3"
+          paint-order="stroke" stroke-linejoin="round" opacity="${osm ? 0.9 : 0.75}">${
+      d.kind === "track"
+        ? escapeXml(d.shape_name) + (d.direction === "cw" ? " · 顺时针" : " · 逆时针")
+        : escapeXml(d.shape_name) + (d.rotation ? ` · 旋转 ${d.rotation}°` : "")
+    }</text>`;
+  gOver.innerHTML = layers;
+
   $("scale").textContent = `画布 1px ≈ ${(1 / proj.scale).toFixed(1)} m · ${W}×${H}`;
+
+  if (osm) {
+    clearTimeout(window.__tileTimer);
+    window.__tileTimer = setTimeout(checkTiles, 1800);
+  }
+}
+
+function escapeXml(s) {
+  return String(s == null ? "" : s).replace(/[<>&"]/g, c => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;" }[c]));
+}
+
+function checkTiles() {
+  if (S.basemap !== "osm") return;
+  const bad = window.__tileFail || 0, good = window.__tileOk || 0;
+  const el = $("tileWarn");
+  if (!bad) { el.classList.add("hidden"); return; }
+  if (!good) {
+    el.textContent = "真实地图取不到瓦片（网络不通或代理拦截），已切回极简底图";
+    el.classList.remove("hidden");
+    setBasemap("minimal");
+    return;
+  }
+  el.textContent = `真实地图有 ${bad} 张瓦片没取到（网络不稳），其余正常`;
+  el.classList.remove("hidden");
 }
 
 let ro = null;
@@ -191,14 +510,24 @@ function watchResize() {
   if (ro) return;
   const wrap = $("canvasWrap");
   let t = null;
-  ro = new ResizeObserver(() => {
-    clearTimeout(t);
-    t = setTimeout(drawMap, 100);
-  });
+  ro = new ResizeObserver(() => { clearTimeout(t); t = setTimeout(drawMap, 120); });
   ro.observe(wrap);
 }
 
+/* ---------------------------------------------------------------- 统计行 */
 function renderStats(d) {
+  if (d.kind === "track") {
+    const total = d.length_m * S.laps;
+    const est = total / (1000 / S.pace);
+    $("stats").innerHTML = `
+      <span><span class="k">单圈</span><b>${Math.round(d.length_m)}</b> m</span>
+      <span><span class="k">圈数</span><b>${S.laps}</b></span>
+      <span><span class="k">总里程</span><b>${(total / 1000).toFixed(2)}</b> km</span>
+      <span><span class="k">预估用时</span><b>${fmtHM(est)}</b></span>
+      <span><span class="k">方向</span><b>${d.direction === "cw" ? "顺时针" : "逆时针"}</b></span>
+      <span class="muted">${escapeXml(d.shape_name)}</span>`;
+    return;
+  }
   const total = d.length_m * S.laps;
   const est = total / (1000 / S.pace);
   const mOk = d.margin_m >= Math.max(10, S.margin * 0.9);
@@ -208,26 +537,42 @@ function renderStats(d) {
     <span><span class="k">离边界</span><b class="${mOk ? "good" : "warn"}">${d.margin_m.toFixed(0)}</b> m</span>
     <span><span class="k">顶点</span><b>${d.track.length}</b></span>
     <span><span class="k">校园面积</span><b>${d.area_km2.toFixed(2)}</b> km²</span>
-  `;
+    ${d.ok ? "" : '<span class="warn">已越过校界（仍可生成）</span>'}`;
   $("placeHint").innerHTML = d.ok
     ? `已放在 <code>${d.center[0].toFixed(5)}, ${d.center[1].toFixed(5)}</code>，离边界最小 <b>${d.margin_m.toFixed(0)} m</b>`
-    : `<span style="color:#e0464b">放不下，把「图形大小」调小</span>`;
+    : `<span style="color:#e0464b">图形比校界还大（余量 ${d.margin_m.toFixed(0)} m）—— 照样能生成，只是会出界</span>`;
 }
 
+/* ---------------------------------------------------------------- 预览 */
 let pending = null;
-function queue() {
-  clearTimeout(pending);
-  pending = setTimeout(refresh, 220);
+function queue() { clearTimeout(pending); pending = setTimeout(refresh, 220); }
+
+function previewParams() {
+  if (S.mode === "track") {
+    return S.track ? { track: S.track, direction: S.direction } : null;
+  }
+  return { shape: S.shape, boundary: S.boundary, size: S.size, margin: S.margin, quality: "fast" };
 }
 
 async function refresh() {
+  const p = previewParams();
+  if (!p) {
+    // 这个校区没有内置跑道：清干净画布，别留一块空的 OSM 底和上一轮的标注
+    lastData = null;
+    $("map").dataset.ready = "";
+    $("map").innerHTML = "";
+    $("tileWarn").classList.add("hidden");
+    $("emptyState").classList.remove("hidden");
+    syncBasemapChrome();
+    $("stats").innerHTML = '<span class="muted">这个校区还没有收录跑道 —— 切到「图形轨迹」画一个吧</span>';
+    return;
+  }
+  $("emptyState").classList.add("hidden");
   $("busy").classList.remove("hidden");
   try {
-    const d = await api("/api/preview", {
-      shape: S.shape, boundary: S.boundary,
-      size: S.size, margin: S.margin,
-    });
+    const d = await api("/api/preview", p);
     lastData = d;
+    syncBasemapChrome();
     drawMap();
     renderStats(d);
   } catch (e) {
@@ -239,20 +584,34 @@ async function refresh() {
 
 /* ---------------------------------------------------------------- 生成 */
 async function doGenerate() {
+  if (S.mode === "track" && !S.track) return alert("这个校区还没有收录跑道。\n\n可以先切到「图形轨迹」，或换一个校区。");
   const btn = $("btnGen");
   btn.disabled = true;
-  $("genHint").textContent = "正在生成（补时间戳 + 越界校验）…";
+  $("genHint").textContent = S.mode === "track"
+    ? "正在生成（沿跑道连圈 + 补时间戳）…"
+    : "正在生成（补时间戳 + 越界校验）…";
   try {
-    const r = await api("/api/generate", {
-      shape: S.shape, boundary: S.boundary, size: S.size, margin: S.margin,
-      pace: fmtPace(S.pace), laps: S.laps, laps_mode: S.lapsMode,
+    const base = {
+      laps: S.laps, pace: fmtPace(S.pace),
       pace_ramp: S.rampOn ? `${fmtPace(S.rampA)},${fmtPace(S.rampB)}` : null,
       out_name: $("outName").value.trim() || null,
-    });
-    const c = r.check;
-    $("genHint").innerHTML =
-      `已生成 <b>${r.file}</b> · ${fmtM(r.length_m)} · ${r.duration_hms} · ` +
-      `校验 ${c.out_of_bounds === 0 ? `<span style="color:#25c06b">全部在界内</span>` : `<span style="color:#e0464b">有 ${c.out_of_bounds} 点越界</span>`}`;
+    };
+    const p = S.mode === "track"
+      ? Object.assign({ track: S.track, direction: S.direction }, base)
+      : Object.assign({ shape: S.shape, boundary: S.boundary, size: S.size,
+                        margin: S.margin, laps_mode: S.lapsMode }, base);
+    const r = await api("/api/generate", p);
+    let line = `已生成 <b>${r.file}</b> · ${fmtM(r.length_m)} · ${r.duration_hms}`;
+    if (r.kind === "track") {
+      line += ` · ${r.laps} 圈 × ${Math.round(r.loop_m)} m · ${r.direction === "cw" ? "顺时针" : "逆时针"}`;
+    } else {
+      const c = r.check;
+      line += ` · 校验 ${c.out_of_bounds === 0
+        ? `<span style="color:#25c06b">全部在界内</span>`
+        : `<span style="color:#e0464b">有 ${c.out_of_bounds} 点在界外</span>`}`;
+    }
+    if (r.warning) line += `<br><span style="color:#e8a13a">⚠ ${escapeXml(r.warning)}</span>`;
+    $("genHint").innerHTML = line;
     await loadRoutes(r.file);
   } catch (e) {
     $("genHint").innerHTML = `<span style="color:#e0464b">生成失败：${e.message}</span>`;
@@ -264,19 +623,10 @@ async function doGenerate() {
 /* ---------------------------------------------------------------- 路线列表 */
 function selectedRoute() { return $("routeSel").value || ""; }
 
-function storedRoute() {
-  try { return localStorage.getItem(ROUTE_KEY) || ""; } catch (e) { return ""; }
-}
-
-function rememberRoute(f) {
-  try { f ? localStorage.setItem(ROUTE_KEY, f) : localStorage.removeItem(ROUTE_KEY); } catch (e) {}
-}
-
 async function loadRoutes(select) {
   const { routes } = await api("/api/routes");
   const sel = $("routeSel");
-  // 想在重建列表后继续选中原来那条：显式传入 > 当前选中 > 上次记住的
-  const want = select || sel.value || storedRoute() || "";
+  const want = select || sel.value || store.get(K.route, "") || "";
   sel.innerHTML = "";
 
   // 占位项：绝不再「静默默认第一条」——那正是「以为选了 A、实际跑了 B」的温床
@@ -294,7 +644,7 @@ async function loadRoutes(select) {
 
   const hit = routes.some(r => r.file === want) ? want : "";
   sel.value = hit;
-  rememberRoute(hit);
+  store.set(K.route, hit);
   syncDown();
   renderTarget();
 }
@@ -437,7 +787,7 @@ function preflight(action) {
                   `· 想继续跑它 → 点 ③ 继续\n· 想换路线 → 先点 ④ 结束模拟，再选新路线点 ②\n\n` +
                   (f && f !== cur ? `（你刚选的《${f}》要等结束后才能跑）` : "") };
   }
-  if (!f) return { msg: `还没选路线。\n\n先在上方的「已生成的路线」里挑一条，再点 ${action}。` };
+  if (!f) return { msg: `还没选路线。\n\n先在下方「已生成的路线」里挑一条，再点 ${action}。` };
   return { f };
 }
 
@@ -558,16 +908,22 @@ async function tick() {
   } catch (e) { /* 服务没起来就静默 */ }
 }
 
-function stopPoll() { if (pollTimer) clearInterval(pollTimer); pollTimer = null; }
-
 /* ---------------------------------------------------------------- 绑定 */
 function bind() {
+  document.querySelectorAll("#modeSeg button").forEach(b => { b.onclick = () => setMode(b.dataset.v); });
+  document.querySelectorAll("#dirSeg button").forEach(b => {
+    b.onclick = () => {
+      S.direction = b.dataset.v;
+      document.querySelectorAll("#dirSeg button").forEach(x => x.classList.toggle("on", x === b));
+      queue();
+    };
+  });
+
   $("size").oninput = e => { S.size = +e.target.value; $("sizeOut").textContent = S.size + " m"; queue(); };
   $("margin").oninput = e => { S.margin = +e.target.value; $("marginOut").textContent = S.margin + " m"; queue(); };
   $("laps").oninput = e => {
     S.laps = +e.target.value;
     $("lapsOut").textContent = S.laps + " 圈";
-    queue();
     if (lastData) renderStats(lastData);
   };
   $("pace").oninput = e => {
@@ -581,6 +937,7 @@ function bind() {
   };
   $("rampA").oninput = e => { S.rampA = +e.target.value; $("rampAOut").textContent = fmtPace(S.rampA); };
   $("rampB").oninput = e => { S.rampB = +e.target.value; $("rampBOut").textContent = fmtPace(S.rampB); };
+  $("trackSel").onchange = () => { S.track = $("trackSel").value; store.set(K.track, S.track); syncTrackLen(); refresh(); };
 
   document.querySelectorAll("#lapsMode button").forEach(b => {
     b.onclick = () => {
@@ -596,9 +953,10 @@ function bind() {
   $("btnPause").onclick = doPause;
   $("btnRelease").onclick = doRelease;
   $("btnRefresh").onclick = () => loadRoutes();
+  $("btnMap").onclick = toggleBasemap;
   $("routeSel").onchange = () => {
     syncDown();
-    rememberRoute(selectedRoute());
+    store.set(K.route, selectedRoute());
     renderTarget();
   };
   $("btnTheme").onclick = toggleTheme;
@@ -607,12 +965,18 @@ function bind() {
 (async function init() {
   // 首帧的主题已由 <head> 里的内联脚本定好，这里只是把状态接过来
   S.theme = document.documentElement.dataset.theme || "light";
-  if (mqDark && !storedTheme()) {
+  if (mqDark && !store.get(K.theme, "")) {
     mqDark.addEventListener("change", e => applyTheme(e.matches ? "dark" : "light", false));
   }
+  S.mode = store.get(K.mode, "shape") === "track" ? "track" : "shape";
+  S.basemap = store.get(K.basemap, "minimal") === "osm" ? "osm" : "minimal";
+  S.track = store.get(K.track, "");
+
   bind();
   watchResize();
-  await Promise.all([loadShapes(), loadDevice(), loadRoutes()]);
+  setBasemap(S.basemap);
+  await Promise.all([loadShapes(), loadBoundaries(), loadTracks(), loadDevice(), loadRoutes()]);
+  applyMode();
   await refresh();
   setInterval(loadDevice, 12000);
   startPoll();

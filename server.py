@@ -16,8 +16,11 @@ import os
 import socket
 import sys
 import threading
+import time
 import traceback
+import urllib.error
 import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -27,6 +30,102 @@ import core  # noqa: E402
 
 STATIC = os.path.join(HERE, "static")
 DEFAULT_PORT = 8788
+
+# OSM 瓦片代理。规矩（tile.openstreetmap.org 使用条款）：
+#   必须带能识别用途的 User-Agent、不得批量预取、不得高频刷。
+# 这里只在用户切到「真实地图」时按当前视野取十几张，并落盘缓存 —— 之后不再回源。
+TILE_URL = "https://tile.openstreetmap.org/%d/%d/%d.png"
+TILE_UA = "NJU-Runner/1.0 (personal local tool; https://github.com/TexasLyn/nju-runner)"
+TILE_OK_MIME = "image/png"
+
+
+def _tile_proxies():
+    """取瓦片时可用的代理。
+
+    tile.openstreetmap.org 在国内**时通时断**（TLS 会被重置），所以直连失败后
+    要能走本机代理。顺序：显式的 NJU_TILE_PROXY → 环境里的 HTTPS_PROXY →
+    几个常见本机代理端口（Clash 7890 / V2Ray 1087 / Surge 6152）。
+    """
+    out = []
+    for v in (os.environ.get("NJU_TILE_PROXY"), os.environ.get("HTTPS_PROXY"),
+              os.environ.get("https_proxy"), os.environ.get("HTTP_PROXY"),
+              os.environ.get("http_proxy"),
+              "http://127.0.0.1:7890", "http://127.0.0.1:1087", "http://127.0.0.1:6152"):
+        if v and v not in out and not v.startswith("127.0.0.1:6"):   # 排除沙盒自己的代理
+            out.append(v)
+    return out
+
+
+_PROXIES = None
+
+
+def _fetch(url, proxy=None, timeout=20):
+    handlers = []
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"https": proxy, "http": proxy}))
+    else:
+        handlers.append(urllib.request.ProxyHandler({}))          # 显式直连
+    op = urllib.request.build_opener(*handlers)
+    req = urllib.request.Request(url, headers={"User-Agent": TILE_UA,
+                                               "Accept": TILE_OK_MIME})
+    with op.open(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+_tile_locks = {}
+_tile_guard = threading.Lock()
+
+
+def _tile_lock(key):
+    with _tile_guard:
+        lk = _tile_locks.get(key)
+        if lk is None:
+            lk = _tile_locks[key] = threading.Lock()
+        return lk
+
+
+def fetch_tile(z, x, y):
+    """取一张 OSM 瓦片，带磁盘缓存。返回 (bytes, from_cache)；彻底取不到返回 (None, False)。"""
+    global _PROXIES
+    n = 2 ** z
+    if z < 0 or z > 19 or x < 0 or y < 0 or x >= n or y >= n:
+        return None, False
+    d = os.path.join(core.TILE_CACHE, str(z), str(x))
+    f = os.path.join(d, "%d.png" % y)
+    if os.path.isfile(f) and os.path.getsize(f) > 0:
+        with open(f, "rb") as fh:
+            return fh.read(), True
+    with _tile_lock(f):
+        if os.path.isfile(f) and os.path.getsize(f) > 0:      # 另一个线程刚抓好
+            with open(f, "rb") as fh:
+                return fh.read(), True
+        if _PROXIES is None:
+            _PROXIES = _tile_proxies()
+        url = TILE_URL % (z, x, y)
+        data = None
+        for proxy in [None] + _PROXIES:                       # 先直连，再逐个代理兜底
+            for _try in range(2):
+                try:
+                    data = _fetch(url, proxy)
+                except Exception:
+                    data = None
+                    continue
+                if data and data.startswith(b"\x89PNG"):
+                    break
+                data = None
+            if data:
+                break
+        if not data:
+            return None, False
+        try:
+            os.makedirs(d, exist_ok=True)
+            tmp = f + ".part"
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp, f)
+        except Exception:
+            pass
+        return data, False
 
 
 def _safe_join(base, name):
@@ -48,19 +147,35 @@ def api_boundaries(_):
     return {"boundaries": core.list_boundaries()}
 
 
+def api_tracks(_):
+    return {"tracks": core.list_tracks()}
+
+
 def api_preview(p):
-    r = core.preview(
+    # 操场模式：真实跑道不做落点搜索，直接回轮廓
+    if p.get("track"):
+        return core.preview_track(p["track"], direction=p.get("direction", "ccw"))
+    return core.preview(
         shape=p.get("shape", "heart"),
         boundary_file=p.get("boundary", "boundary-nju-xianlin.geojson"),
         size=p.get("size"),
         margin=float(p.get("margin", 60.0)),
         quality=p.get("quality", "fast"),
     )
-    return r
 
 
 def api_generate(p):
-    r = core.generate(
+    if p.get("track"):
+        return core.generate_track(
+            track_file=p["track"],
+            out_name=p.get("out_name"),
+            pace=p.get("pace", "6:00"),
+            laps=int(p.get("laps", 4)),
+            direction=p.get("direction", "ccw"),
+            pace_ramp=p.get("pace_ramp") or None,
+            seed=int(p.get("seed", 42)),
+        )
+    return core.generate(
         shape=p.get("shape", "heart"),
         boundary_file=p.get("boundary", "boundary-nju-xianlin.geojson"),
         out_name=p.get("out_name"),
@@ -72,7 +187,6 @@ def api_generate(p):
         seed=int(p.get("seed", 42)),
         margin=float(p.get("margin", 60.0)),
     )
-    return r
 
 
 def api_check(p):
@@ -155,6 +269,7 @@ def api_setloc(p):
 GET_ROUTES = {
     "/api/shapes": api_shapes,
     "/api/boundaries": api_boundaries,
+    "/api/tracks": api_tracks,
     "/api/routes": api_routes,
     "/api/device": api_device,
     "/api/status": api_status,
@@ -186,11 +301,12 @@ class Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
         if isinstance(body, str):
             body = body.encode("utf-8")
+        hdrs = {"Content-Type": ctype,
+                "Content-Length": str(len(body)),
+                "Cache-Control": "no-store"}
+        hdrs.update(extra or {})           # extra 可覆盖默认（比如瓦片要长缓存）
         self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        for k, v in (extra or {}).items():
+        for k, v in hdrs.items():
             self.send_header(k, v)
         self.end_headers()
         if self.command != "HEAD":
@@ -224,6 +340,22 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 traceback.print_exc()
                 return self._err(500, str(e))
+
+        if path == "/api/tile":
+            q = urllib.parse.parse_qs(u.query)
+            try:
+                z, x, y = (int(q.get(k, ["-1"])[0]) for k in ("z", "x", "y"))
+            except Exception:
+                return self._err(400, "z/x/y 必须是整数")
+            data, cached = fetch_tile(z, x, y)
+            if data is None:
+                # 取不到就回 404：前端 <image> 的 onerror 会记账，
+                # 一张都取不到时自动切回极简底图（比无声留白友好）
+                return self._err(404, "瓦片暂时取不到")
+            return self._send(200, data, TILE_OK_MIME, {
+                "Cache-Control": "public, max-age=604800",
+                "X-Tile": "hit" if cached else "fetch",
+            })
 
         if path == "/api/download":
             q = urllib.parse.parse_qs(u.query)

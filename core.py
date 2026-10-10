@@ -42,8 +42,20 @@ VENDOR = os.path.join(HERE, "vendor")
 BIN = os.path.join(HOME, ".local/bin")
 
 OUT_DIR = os.path.join(HERE, "out")
-BOUND_DIR = os.path.join(HERE, "data", "boundaries")
+DATA_DIR = os.path.join(HERE, "data")
+BOUND_DIR = os.path.join(DATA_DIR, "boundaries")
+TRACK_DIR = os.path.join(DATA_DIR, "tracks")
+TILE_CACHE = os.path.join(DATA_DIR, "tilecache")
 PLAY_LOG = os.path.join(OUT_DIR, "play.log")
+
+# 校区中文短名：文件名 slug → 显示名。新增校区只要往 data/boundaries 丢文件即可，
+# 这里只是让下拉里显示的短一点（长名走 GeoJSON 的 properties.name）。
+CAMPUS_LABEL = {
+    "gulou": "鼓楼",
+    "xianlin": "仙林",
+    "pukou": "浦口",
+    "suzhou": "苏州",
+}
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -487,25 +499,206 @@ def list_shapes():
     return sorted(out, key=lambda s: s["default_size"])
 
 
+def _read_props(path):
+    """读 GeoJSON 的 properties（拿 name / source / campus 这类元数据）。失败返回 {}。"""
+    try:
+        raw = json.load(open(path, encoding="utf-8"))
+        if isinstance(raw, dict) and raw.get("type") == "FeatureCollection":
+            return raw["features"][0].get("properties") or {}
+        if isinstance(raw, dict) and raw.get("type") == "Feature":
+            return raw.get("properties") or {}
+    except Exception:
+        pass
+    return {}
+
+
+def _campus_of(slug):
+    """从文件名里抠出校区短名：boundary-nju-xianlin / track-nju-xianlin-1 → xianlin。"""
+    for key in CAMPUS_LABEL:
+        if key in (slug or ""):
+            return key
+    return ""
+
+
 def list_boundaries():
+    """列出可用边界（= 校区）。带显示名、校区短名、面积与中心。"""
     out = []
     if os.path.isdir(BOUND_DIR):
         for fn in sorted(os.listdir(BOUND_DIR)):
-            if fn.lower().endswith((".geojson", ".json")):
-                path = os.path.join(BOUND_DIR, fn)
-                try:
-                    ring = gpxart.read_boundary(path)
-                    frame = gpxart.Frame(ring)
-                    poly = [frame.fwd(lo, la) for lo, la in ring]
-                    area = abs(gpxart.shoelace(poly)) / 1e6
-                    clon, clat = frame.inv(
-                        sum(p[0] for p in poly) / len(poly),
-                        sum(p[1] for p in poly) / len(poly))
-                except Exception as e:
-                    area, clat, clon = 0.0, 0.0, 0.0
-                out.append({"file": fn, "area_km2": round(area, 3),
-                            "center": [round(clat, 6), round(clon, 6)]})
+            if not fn.lower().endswith((".geojson", ".json")):
+                continue
+            path = os.path.join(BOUND_DIR, fn)
+            props = _read_props(path)
+            slug = fn.rsplit(".", 1)[0].replace("boundary-", "").replace("nju-", "")
+            campus = _campus_of(fn)
+            try:
+                ring = gpxart.read_boundary(path)
+                frame = gpxart.Frame(ring)
+                poly = [frame.fwd(lo, la) for lo, la in ring]
+                area = abs(gpxart.shoelace(poly)) / 1e6
+                clon, clat = frame.inv(
+                    sum(p[0] for p in poly) / len(poly),
+                    sum(p[1] for p in poly) / len(poly))
+            except Exception:
+                area, clat, clon = 0.0, 0.0, 0.0
+            out.append({
+                "file": fn,
+                "name": props.get("name") or slug,
+                "label": CAMPUS_LABEL.get(campus, slug),
+                "campus": campus,
+                "source": props.get("source") or "",
+                "area_km2": round(area, 3),
+                "center": [round(clat, 6), round(clon, 6)],
+                "points": 0,
+            })
+            try:
+                out[-1]["points"] = len(gpxart.read_boundary(path))
+            except Exception:
+                pass
     return out
+
+
+# ---------------------------------------------------------------- 真实操场（OSM 轮廓）
+
+def read_track(path):
+    """读操场轮廓，返回 (lon, lat) 点列。支持 LineString / Polygon / FeatureCollection。"""
+    raw = json.load(open(path, encoding="utf-8"))
+    if isinstance(raw, dict) and raw.get("type") == "FeatureCollection":
+        geom = raw["features"][0]["geometry"]
+    elif isinstance(raw, dict) and raw.get("type") == "Feature":
+        geom = raw["geometry"]
+    else:
+        geom = raw
+    t = geom.get("type")
+    if t == "LineString":
+        return [(float(p[0]), float(p[1])) for p in geom["coordinates"]]
+    if t == "Polygon":
+        return [(float(p[0]), float(p[1])) for p in geom["coordinates"][0]]
+    raise ValueError("操场文件需为 LineString/Polygon，实际是 %s" % t)
+
+
+def _close_ring(pts):
+    """把首尾接上（OSM 的 way 有时不显式闭合）。"""
+    if len(pts) >= 2 and (abs(pts[0][0] - pts[-1][0]) > 1e-9 or abs(pts[0][1] - pts[-1][1]) > 1e-9):
+        return list(pts) + [pts[0]]
+    return list(pts)
+
+
+def _track_path(track_file):
+    return track_file if os.path.isabs(track_file) else os.path.join(TRACK_DIR, track_file)
+
+
+def _bbox_view(pts_ll, pad_ratio=0.22, pad_min=70.0):
+    """给操场算一个「取景框」矩形（lat/lon），供前端把画面套上去。
+
+    用操场自己的外接矩形 + 内边距，而不是整个校区边界 —— 标准操场只占校区一角，
+    按校界取景会缩得太小、跑道只剩一条线。
+    """
+    lons = [p[0] for p in pts_ll]
+    lats = [p[1] for p in pts_ll]
+    lon0, lon1 = min(lons), max(lons)
+    lat0, lat1 = min(lats), max(lats)
+    w = (lon1 - lon0) * gpxart.m_per_deg_lon((lat0 + lat1) / 2)
+    h = (lat1 - lat0) * M_PER_DEG
+    pad = max(pad_min, pad_ratio * max(w, h))
+    dl = pad / gpxart.m_per_deg_lon((lat0 + lat1) / 2)
+    dla = pad / M_PER_DEG
+    return [[lat0 - dla, lon0 - dl], [lat0 - dla, lon1 + dl],
+            [lat1 + dla, lon1 + dl], [lat1 + dla, lon0 - dl]]
+
+
+def list_tracks():
+    """列出内置的真实操场。每条带：所属校区、名称、长度、中心、圈数建议。"""
+    out = []
+    if not os.path.isdir(TRACK_DIR):
+        return out
+    for fn in sorted(os.listdir(TRACK_DIR)):
+        if not fn.lower().endswith((".geojson", ".json")):
+            continue
+        path = os.path.join(TRACK_DIR, fn)
+        props = _read_props(path)
+        try:
+            pts = _close_ring(read_track(path))
+            frame = gpxart.Frame(pts)
+            xy = [frame.fwd(lo, la) for lo, la in pts]
+            length = gpxart.path_len(xy)
+            clon, clat = frame.inv(
+                sum(p[0] for p in xy) / len(xy), sum(p[1] for p in xy) / len(xy))
+        except Exception as e:
+            out.append({"file": fn, "name": props.get("name") or fn, "error": str(e)})
+            continue
+        campus = props.get("campus") or _campus_of(fn)
+        out.append({
+            "file": fn,
+            "name": props.get("name") or fn,
+            "campus": campus,
+            "label": CAMPUS_LABEL.get(campus, campus),
+            "lane": props.get("lane") or "",
+            "source": props.get("source") or "",
+            "length_m": round(length, 1),
+            "center": [round(clat, 6), round(clon, 6)],
+            "points": len(pts),
+        })
+    # 按「校区顺序（鼓楼→仙林→浦口→苏州）→ 长度」排
+    order = {k: i for i, k in enumerate(["gulou", "xianlin", "pukou", "suzhou"])}
+    out.sort(key=lambda t: (order.get(t.get("campus"), 99), t.get("length_m") or 0))
+    return out
+
+
+def preview_track(track_file, direction="ccw"):
+    """操场预览：不做落点搜索 —— 真实跑道就长在那儿。
+
+    返回结构与 preview() 对齐（track / view / center / length_m），
+    前端那套绘制代码不用改。
+    """
+    path = _track_path(track_file)
+    if not os.path.exists(path):
+        raise FileNotFoundError("找不到操场文件：%s" % track_file)
+    pts = _close_ring(read_track(path))
+    if direction == "cw":
+        pts = list(reversed(pts))
+
+    frame = gpxart.Frame(pts)
+    xy = [frame.fwd(lo, la) for lo, la in pts]
+    length = gpxart.path_len(xy)
+    clon, clat = frame.inv(sum(p[0] for p in xy) / len(xy),
+                           sum(p[1] for p in xy) / len(xy))
+    props = _read_props(path)
+    campus = props.get("campus") or _campus_of(track_file)
+
+    campus_ring = None
+    campus_name = ""
+    for b in list_boundaries():
+        if b["campus"] == campus:
+            try:
+                r = gpxart.read_boundary(os.path.join(BOUND_DIR, b["file"]))
+                campus_ring = [[p[1], p[0]] for p in r]
+                campus_name = b["name"]
+            except Exception:
+                pass
+            break
+
+    view = _bbox_view(pts)
+    return {
+        "kind": "track",
+        "shape": "track", "shape_name": props.get("name") or "操场跑道",
+        "size": length, "rotation": 0,
+        "track_file": track_file,
+        "campus": campus, "campus_name": campus_name,
+        "center": [clat, clon],
+        "length_m": length,
+        "margin_m": 0.0,
+        "closed": True,
+        "area_km2": 0.0,
+        "direction": direction,
+        "view": view,
+        # 操场模式没有「校界内落点」这回事：boundary 留空，校园轮廓单独给
+        "boundary": None,
+        "campus_boundary": campus_ring,
+        "track": [[p[1], p[0]] for p in pts],
+        "ok": True,
+    }
+
 
 
 # ---------------------------------------------------------------- 预览（纯几何，不补时间）
@@ -540,6 +733,7 @@ def preview(shape, boundary_file, size=None, margin=60.0, seed_ignore=None,
     length = gpxart.path_len(placed)
     area = abs(gpxart.shoelace(poly)) / 1e6
     return {
+        "kind": "shape",
         "shape": shape, "shape_name": cn,
         "size": size, "rotation": rot,
         "center": [clat, clon],
@@ -547,7 +741,10 @@ def preview(shape, boundary_file, size=None, margin=60.0, seed_ignore=None,
         "margin_m": margin_m,
         "closed": closed,
         "area_km2": area,
+        # view = 取景框（图形版就是校界本身）；前端统一按 view 投影
+        "view": [[p[1], p[0]] for p in ring],
         "boundary": [[p[1], p[0]] for p in ring],       # [lat,lon]
+        "campus_boundary": None,
         "track": [[p[1], p[0]] for p in pts_ll],        # [lat,lon]
         "ok": margin_m > 0,
     }
@@ -576,9 +773,43 @@ def check_bounds(gpx_path, boundary_file, margin=50.0, step=5.0):
 
 # ---------------------------------------------------------------- 生成 GPX（补时间戳）
 
+# 前端为了好看，配速发的是 `6'00"`；vendor/runroute 的 parse_pace 只认 `6:00`
+# 和纯秒数（`360`）。所以在这一层统一成 `M:SS` 再交给 vendor —— 不去改 vendor，
+# 免得 tools/sync-vendor.py 重同步时把补丁冲掉。
+_PACE_RE = re.compile(r"^\s*(\d+)\s*[:'\u2032]\s*(\d+(?:\.\d+)?)\s*[\"\u2033]?\s*$")
+_PACE_PLAIN_RE = re.compile(r"^\s*\d+(?:\.\d+)?\s*$")
+
+
+def _norm_pace(text, what="配速"):
+    """各种写法 → vendor 认的 `M:SS`（或原样放行纯秒数）。"""
+    s = str(text).strip()
+    m = _PACE_RE.match(s)
+    if m:
+        return "%d:%02d" % (int(m.group(1)), int(round(float(m.group(2)))))
+    if _PACE_PLAIN_RE.match(s):
+        return s                      # 纯数字：vendor 自己按秒/公里解释
+    raise ValueError("看不懂的%s：%r（应该像 6:00 / 6'00\" / 360）" % (what, text))
+
+
+def _norm_pace_ramp(text):
+    """`7'30",4'30"` → `7:30,4:30`。"""
+    if not text:
+        return text
+    parts = [p for p in str(text).replace("，", ",").replace(" ", ",").split(",") if p.strip()]
+    if len(parts) != 2:
+        raise ValueError("配速渐变要两个值，例如 7:30,4:30（收到 %r）" % text)
+    return ",".join(_norm_pace(p, "配速渐变值") for p in parts)
+
+
 def generate(shape, boundary_file, out_name=None, size=None, pace="6:00",
              laps=1, laps_mode="retrace", pace_ramp=None, seed=42,
-             margin=60.0, avoid=None, jitter=None, pace_noise=None):
+             margin=60.0, avoid=None, jitter=None, pace_noise=None, allow_out=True):
+    """生成图形 GPX。
+
+    allow_out=True（默认）：**越界不再拒绝**。以前余量为负会直接报错，
+    但校界只是个参考 —— 有人国庆回老家照样跑，那边根本没有「南大边界」。
+    现在越界照生成，只回一条 warning 让用户知道。
+    """
     boundary_path = boundary_file if os.path.isabs(boundary_file) \
         else os.path.join(BOUND_DIR, boundary_file)
     ring, frame, poly = load_boundary(boundary_path)
@@ -588,8 +819,15 @@ def generate(shape, boundary_file, out_name=None, size=None, pace="6:00",
     shape_pts = gpxart.normalize(fn(), size)
     margin_m, rot, cx, cy, placed = place_shape(
         poly, shape_pts, shape, need=max(margin, 0.0), avoid=avoid)
+
+    warning = None
     if margin_m <= 0:
-        raise ValueError("图形越界了（余量 %.0f m），把尺寸调小" % margin_m)
+        if not allow_out:
+            raise ValueError("图形越界了（余量 %.0f m），把尺寸调小" % margin_m)
+        warning = ("图形超出校界 %.0f m —— 仍按最优位置生成。"
+                   "要完全落在校内，请把「图形大小」调小" % abs(margin_m))
+    elif margin_m < margin * 0.9:
+        warning = "余量只有 %.0f m（目标 %.0f m），已尽量贴边放置" % (margin_m, margin)
 
     pts_ll = [frame.inv(x, y) for (x, y) in placed]
     gap = math.hypot(placed[-1][0] - placed[0][0], placed[-1][1] - placed[0][1])
@@ -603,6 +841,8 @@ def generate(shape, boundary_file, out_name=None, size=None, pace="6:00",
 
     tmp = os.path.join(OUT_DIR, ".geom-%d.gpx" % os.getpid())
     gpxart.write_geom_gpx(pts_ll, tmp)
+    pace = _norm_pace(pace)
+    pace_ramp = _norm_pace_ramp(pace_ramp)
     cmd = _script_cmd(RUNROUTE_PATH, "make", "--from-gpx", tmp, "--pace", str(pace),
            "--laps", str(laps), "--laps-mode", laps_mode,
            "--seed", str(seed), "-o", out_path)
@@ -625,6 +865,7 @@ def generate(shape, boundary_file, out_name=None, size=None, pace="6:00",
     return {
         "file": os.path.basename(out_path),
         "path": out_path,
+        "kind": "shape",
         "duration": st.get("duration"),
         "duration_hms": runroute.fmt_hms(st.get("duration") or 0),
         "length_m": st.get("distance"),
@@ -632,7 +873,79 @@ def generate(shape, boundary_file, out_name=None, size=None, pace="6:00",
         "pace": pace, "laps": laps, "laps_mode": laps_mode,
         "pace_ramp": pace_ramp,
         "margin_m": margin_m, "rotation": rot,
+        "warning": warning,
         "check": chk,
+        "raw": (res.stdout or "").strip().splitlines(),
+    }
+
+
+# ---------------------------------------------------------------- 生成 GPX（操场跑道）
+
+def generate_track(track_file, out_name=None, pace="6:00", laps=4, direction="ccw",
+                   pace_ramp=None, seed=42, jitter=None, pace_noise=None):
+    """**操场跑步**：沿真实跑道轮廓跑 N 圈。
+
+    跑道是真实存在的闭合环，不存在「落点」「越界」这套 —— 直接把轮廓
+    交给 runroute，用 `--laps N --laps-mode forward` 连圈（闭合环首尾重合，
+    圈与圈之间不会有额外连线）。
+    """
+    path = _track_path(track_file)
+    if not os.path.exists(path):
+        raise FileNotFoundError("找不到操场文件：%s" % track_file)
+    pts_ll = _close_ring(read_track(path))
+    if direction == "cw":
+        pts_ll = list(reversed(pts_ll))
+    if len(pts_ll) < 4:
+        raise ValueError("跑道轮廓点太少（%d），没法生成" % len(pts_ll))
+
+    props = _read_props(path)
+    campus = props.get("campus") or _campus_of(track_file)
+    base = props.get("name") or os.path.splitext(os.path.basename(track_file))[0]
+    slug = re.sub(r"[^\w\u4e00-\u9fff-]+", "-", base).strip("-")
+
+    out_name = out_name or "track-%s-%s.gpx" % (slug, time.strftime("%m%d-%H%M%S"))
+    if not out_name.endswith(".gpx"):
+        out_name += ".gpx"
+    out_path = os.path.join(OUT_DIR, os.path.basename(out_name))
+
+    tmp = os.path.join(OUT_DIR, ".track-%d.gpx" % os.getpid())
+    gpxart.write_geom_gpx(pts_ll, tmp)
+    pace = _norm_pace(pace)
+    pace_ramp = _norm_pace_ramp(pace_ramp)
+    cmd = _script_cmd(RUNROUTE_PATH, "make", "--from-gpx", tmp, "--pace", str(pace),
+                      "--laps", str(int(laps)), "--laps-mode", "forward",
+                      "--seed", str(seed), "-o", out_path)
+    if pace_ramp:
+        cmd += ["--pace-ramp", pace_ramp]
+    if jitter is not None:
+        cmd += ["--jitter", str(jitter)]
+    if pace_noise is not None:
+        cmd += ["--pace-noise", str(pace_noise)]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    if res.returncode != 0:
+        raise RuntimeError((res.stderr or res.stdout or "runroute 失败").strip())
+
+    st = runroute.gpx_stats(out_path)
+    frame = gpxart.Frame(pts_ll)
+    xy = [frame.fwd(lo, la) for lo, la in pts_ll]
+    return {
+        "file": os.path.basename(out_path),
+        "path": out_path,
+        "kind": "track",
+        "duration": st.get("duration"),
+        "duration_hms": runroute.fmt_hms(st.get("duration") or 0),
+        "length_m": st.get("distance"),
+        "loop_m": gpxart.path_len(xy),
+        "points": st.get("points"),
+        "pace": pace, "laps": int(laps), "laps_mode": "forward",
+        "direction": direction,
+        "pace_ramp": pace_ramp,
+        "track_file": track_file, "campus": campus,
+        "warning": None, "check": None,
         "raw": (res.stdout or "").strip().splitlines(),
     }
 

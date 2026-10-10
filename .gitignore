@@ -9,6 +9,9 @@ venv/
 out/*
 !out/.gitkeep
 
+# ---- 真实地图瓦片缓存（本地抓下来的，不进仓库）----
+data/tilecache/
+
 # ---- 系统 ----
 .DS_Store
 Thumbs.db

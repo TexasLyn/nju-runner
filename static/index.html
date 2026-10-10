@@ -45,18 +45,36 @@
 <main>
   <aside class="panel" id="panel">
 
-    <section class="block">
-      <h2>1 · 选图形</h2>
+    <section class="block" data-title="选路线">
+      <h2>1 · 选路线</h2>
+      <div class="seg" id="modeSeg">
+        <button type="button" data-v="shape" class="on">图形轨迹</button>
+        <button type="button" data-v="track">操场跑道</button>
+      </div>
       <div class="shapes" id="shapes"></div>
+      <p class="hint hidden" id="trackOnlyHint">
+        操场模式：直接沿真实跑道跑 N 圈（轮廓取自 OpenStreetMap）。
+      </p>
     </section>
 
-    <section class="block">
-      <h2>2 · 尺寸与位置</h2>
+    <section class="block" data-title="校区">
+      <h2>2 · 校区</h2>
+      <div class="campus" id="campusSeg"></div>
+      <p class="hint" id="campusHint">正在载入校区边界…</p>
+      <div id="trackBox" class="hidden">
+        <label class="row"><span>跑道</span><output id="trackLen"></output></label>
+        <select id="trackSel"></select>
+        <p class="hint" id="trackHint"></p>
+      </div>
+    </section>
+
+    <section class="block" data-title="尺寸与位置" id="blkPlace">
+      <h2>3 · 尺寸与位置</h2>
       <label class="row">
         <span>图形大小</span>
         <output id="sizeOut">560 m</output>
       </label>
-      <input type="range" id="size" min="150" max="1600" step="10" value="560">
+      <input type="range" id="size" min="150" max="2400" step="10" value="560">
 
       <label class="row">
         <span>离边界最小余量</span>
@@ -66,14 +84,18 @@
       <p class="hint" id="placeHint">余量越大越安全；放不下时会自动微调角度。</p>
     </section>
 
-    <section class="block">
-      <h2>3 · 跑法</h2>
+    <section class="block" data-title="跑法">
+      <h2>4 · 跑法</h2>
       <div class="seg" id="lapsMode">
         <button type="button" data-v="retrace" class="on">往复（到终点原路返回）</button>
         <button type="button" data-v="forward">同向绕圈</button>
       </div>
+      <div class="seg hidden" id="dirSeg">
+        <button type="button" data-v="ccw" class="on">逆时针（标准）</button>
+        <button type="button" data-v="cw">顺时针</button>
+      </div>
       <label class="row"><span>圈数</span><output id="lapsOut">1 圈</output></label>
-      <input type="range" id="laps" min="1" max="6" step="1" value="1">
+      <input type="range" id="laps" min="1" max="12" step="1" value="1">
 
       <label class="row"><span>配速</span><output id="paceOut">6'00" /km</output></label>
       <input type="range" id="pace" min="300" max="540" step="5" value="360">
@@ -90,16 +112,16 @@
       </div>
     </section>
 
-    <section class="block">
-      <h2>4 · 生成</h2>
+    <section class="block" data-title="生成">
+      <h2>5 · 生成</h2>
       <label class="row"><span>文件名</span></label>
       <input type="text" id="outName" class="text" placeholder="留空自动命名">
       <button class="primary" id="btnGen" type="button">生成 GPX</button>
       <p class="hint" id="genHint"></p>
     </section>
 
-    <section class="block">
-      <h2>5 · 定位工具（可选）</h2>
+    <section class="block" data-title="定位工具（可选）">
+      <h2>6 · 定位工具（可选）</h2>
       <details class="cus">
         <summary>手动指定经纬度定点</summary>
         <div class="cusrow">
@@ -120,6 +142,19 @@
     <div class="canvas-wrap" id="canvasWrap">
       <svg id="map" preserveAspectRatio="xMidYMid meet"></svg>
       <div class="busy hidden" id="busy">计算中…</div>
+      <div class="emptystate hidden" id="emptyState">
+        <b>这个校区还没有收录跑道</b>
+        <span>切到上面的「图形轨迹」给这个校区画一个，或换一个已收录跑道的校区。</span>
+      </div>
+      <button class="maptoggle" id="btnMap" type="button" title="在极简底图和真实地图之间切换">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M3 6.6 9 4l6 2.6L21 4v13.4L15 20l-6-2.6L3 20z"
+                fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>
+          <path d="M9 4v13.4M15 6.6V20" stroke="currentColor" stroke-width="1.1" opacity=".5"/>
+        </svg>
+        <span id="mapLabel">真实地图</span>
+      </button>
+      <div class="tilewarn hidden" id="tileWarn">真实地图取不到瓦片（网络问题），已继续用极简底图</div>
     </div>
     <div class="legend">
       <i class="lg-bound"></i>校界
@@ -127,6 +162,8 @@
       <i class="lg-start"></i>起点
       <i class="lg-end"></i>终点
       <span class="grow"></span>
+      <a class="attrib hidden" id="osmAttrib" href="https://www.openstreetmap.org/copyright"
+         target="_blank" rel="noopener noreferrer" title="地图数据 © OpenStreetMap 贡献者">© OpenStreetMap</a>
       <span id="scale"></span>
     </div>
   </section>
