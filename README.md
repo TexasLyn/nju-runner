@@ -50,6 +50,51 @@ pip install numpy
 pip install pymobiledevice3   :: 只有要推真机才需要
 ```
 
+#### 没装 Python / 提示 "No Python with numpy found"
+
+`start.bat` 不会只说一句「找不到」就完事 —— 它会把 **`py -0p`（所有已装 Python 及路径）、
+`where python`、`where python3`** 全部打印出来，再给对应的修法。先看那三行的输出：
+
+- **三行都是空的** → 这台机器上没有真的 Python，去装一个（下节）。
+- **列出了 Python 但没有 numpy** → 版本装对了，只缺包：
+  `py -3.13 -m pip install numpy`
+- **`python` 指向 `...\WindowsApps\python.exe`** → 那是 **Microsoft Store 的占位程序**，
+  不是真 Python。到「设置 → 应用 → 高级应用设置 → 应用执行别名」里把两个 Python
+  别名关掉，再开一个新终端。
+
+> **装完必须开一个新终端。** `PrependPath` 只影响之后新建的进程，
+> 已经在开的 cmd / PowerShell 里 PATH 不会变 —— 这是最常见的「装完了怎么还说找不到」。
+
+#### Windows on ARM 上装 x64 还是 ARM64？
+
+**装 x64 版**，即使你的机器是 ARM（Surface Pro X、骁龙本、Apple Silicon 上的虚拟机）。
+
+numpy 两个架构都有 wheel（`win_arm64` 从 numpy 2.3 起有了），所以**只画图 + 生成 GPX
+的话 ARM64 完全够用**。但 `pymobiledevice3` 依赖 `cryptography`，
+而 **cryptography 只发 `win_amd64`、没有 `win_arm64`** —— 在 ARM64 的 Python 上
+pip 会退回去编译源码（需要 Rust 工具链），基本必失败。
+
+x64 版 Python 在 Windows 11 ARM 上跑在模拟层里，性能足够（我们这点计算量无所谓），
+而且 numpy / cryptography / psutil 全都有现成 wheel，**画图和真机注入两条路一次装齐**。
+
+一条命令装 x64 版（PowerShell 里跑）：
+
+```powershell
+curl.exe -L -o "$env:TEMP\py-amd64.exe" https://www.python.org/ftp/python/3.13.16/python-3.13.16-amd64.exe
+Start-Process -Wait "$env:TEMP\py-amd64.exe" -ArgumentList 'InstallAllUsers=0','PrependPath=1','Include_test=0'
+```
+
+然后**开新终端**：
+
+```powershell
+py -3.13 -m pip install numpy
+py -3.13 -m pip install pymobiledevice3   # 可选，推真机才要
+py -3.13 -c "import numpy, sys; print(sys.version, numpy.__version__, numpy.__file__)"
+```
+
+（`winget install --id Python.Python.3.13` 也能装，但它在 ARM 机器上会挑 **ARM64**
+那份，只够画图 —— 想要真机注入就别用 winget。）
+
 装完先自检一遍（不碰手机、不碰定位）：
 
 ```powershell
